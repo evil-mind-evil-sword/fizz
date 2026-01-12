@@ -1,0 +1,5 @@
+module CFizz {
+    header "../../include/libfizz.h"
+    link "fizz"
+    export *
+}

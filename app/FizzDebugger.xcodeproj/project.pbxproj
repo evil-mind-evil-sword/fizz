@@ -1,0 +1,300 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1000001 /* FizzDebuggerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000011 /* FizzDebuggerApp.swift */; };
+		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000012 /* ContentView.swift */; };
+		A1000003 /* FizzWorld.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000013 /* FizzWorld.swift */; };
+		A1000004 /* SceneView3D.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000014 /* SceneView3D.swift */; };
+		A1000005 /* libfizz.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = A1000021 /* libfizz.dylib */; };
+		A1000006 /* libfizz.dylib in CopyFiles */ = {isa = PBXBuildFile; fileRef = A1000021 /* libfizz.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A1000030 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				A1000006 /* libfizz.dylib in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A1000011 /* FizzDebuggerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FizzDebuggerApp.swift; sourceTree = "<group>"; };
+		A1000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A1000013 /* FizzWorld.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FizzWorld.swift; sourceTree = "<group>"; };
+		A1000014 /* SceneView3D.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneView3D.swift; sourceTree = "<group>"; };
+		A1000015 /* FizzDebugger-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FizzDebugger-Bridging-Header.h"; sourceTree = "<group>"; };
+		A1000021 /* libfizz.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libfizz.dylib; path = ../zig-out/lib/libfizz.dylib; sourceTree = "<group>"; };
+		A1000022 /* libfizz.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = libfizz.h; path = ../include/libfizz.h; sourceTree = "<group>"; };
+		A1000041 /* FizzDebugger.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FizzDebugger.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A100003E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000005 /* libfizz.dylib in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A1000050 /* FizzDebugger */ = {
+			isa = PBXGroup;
+			children = (
+				A1000011 /* FizzDebuggerApp.swift */,
+				A1000012 /* ContentView.swift */,
+				A1000013 /* FizzWorld.swift */,
+				A1000014 /* SceneView3D.swift */,
+				A1000015 /* FizzDebugger-Bridging-Header.h */,
+			);
+			path = FizzDebugger;
+			sourceTree = "<group>";
+		};
+		A1000051 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A1000021 /* libfizz.dylib */,
+				A1000022 /* libfizz.h */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		A1000052 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1000041 /* FizzDebugger.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A1000060 /* Root */ = {
+			isa = PBXGroup;
+			children = (
+				A1000050 /* FizzDebugger */,
+				A1000051 /* Frameworks */,
+				A1000052 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A1000040 /* FizzDebugger */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A100004E /* Build configuration list for PBXNativeTarget "FizzDebugger" */;
+			buildPhases = (
+				A100003C /* Sources */,
+				A100003E /* Frameworks */,
+				A100003F /* Resources */,
+				A1000030 /* CopyFiles */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FizzDebugger;
+			productName = FizzDebugger;
+			productReference = A1000041 /* FizzDebugger.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A1000038 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					A1000040 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A100003B /* Build configuration list for PBXProject "FizzDebugger" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A1000060 /* Root */;
+			productRefGroup = A1000052 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A1000040 /* FizzDebugger */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A100003F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A100003C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001 /* FizzDebuggerApp.swift in Sources */,
+				A1000002 /* ContentView.swift in Sources */,
+				A1000003 /* FizzWorld.swift in Sources */,
+				A1000004 /* SceneView3D.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A100004A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A100004B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		A100004C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../include";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/../zig-out/lib";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.emes.FizzDebugger;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "FizzDebugger/FizzDebugger-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A100004D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../include";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/../zig-out/lib";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.emes.FizzDebugger;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "FizzDebugger/FizzDebugger-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A100003B /* Build configuration list for PBXProject "FizzDebugger" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100004A /* Debug */,
+				A100004B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A100004E /* Build configuration list for PBXNativeTarget "FizzDebugger" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100004C /* Debug */,
+				A100004D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = A1000038 /* Project object */;
+}
