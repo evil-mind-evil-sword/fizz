@@ -111,4 +111,4 @@ fizz_world_destroy(world);
 
 ## License
 
-MIT
+AGPL-3.0
