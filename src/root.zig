@@ -4,27 +4,33 @@
 //! to infer world dynamics from observations.
 //!
 //! Architecture:
-//! - CRP/GLMB for unknown entity count with object permanence
+//! - ECS (Entity-Component-System) for flexible entity composition
+//! - SLDS (Switching Linear Dynamical System) with Spelke core knowledge priors
+//! - CRP/IBP for unknown entity count and component membership
 //! - Rao-Blackwellized particle filter (Kalman for continuous, sample discrete)
-//! - Linear-Gaussian dynamics with discrete contact modes (SLDS)
 //! - 3D Gaussian mixture observation model (entities = mixture components)
 //!
-//! Phase 1: Minimal Generative Model
-//! - Vec3/Mat3 math primitives
-//! - Entity state with Gaussian position/velocity
-//! - Discrete physics types (bouncy, sticky, slippery, standard)
-//! - Linear-Gaussian dynamics with Kalman filtering
-//! - Ground collision handling
-//! - 3D GMM observation model
+//! Core concepts:
+//! - Entity: Just an ID (generational for safe reuse)
+//! - Component: Data attached to entities (Position, Velocity, Physics, etc.)
+//! - System: Global program that queries entities by component signature
+//! - Mode: Discrete contact state (free, ground, supported, attached, agency)
 //!
-//! Phase 2: SMC Inference
-//! - Particle representation with weighted world hypotheses
-//! - Importance weighting from observation likelihood
-//! - Systematic resampling with ESS monitoring
-//! - Likelihood tempering/annealing for stable inference
-//! - Gibbs rejuvenation for discrete physics type inference
+//! Spelke core knowledge encoded as:
+//! - Object permanence: Entities persist through occlusion
+//! - Solidity: Objects cannot pass through each other (mode switching)
+//! - Continuity: Smooth trajectories (low process noise)
+//! - Support: Objects at rest stay at rest (stability islands)
+//! - Agency: Self-propelled entities have different dynamics
 
 pub const math = @import("math.zig");
+pub const ecs = @import("ecs/mod.zig");
+pub const slds = @import("slds/mod.zig");
+pub const association = @import("association/mod.zig");
+pub const crp = @import("crp/mod.zig");
+pub const smc_swarm = @import("smc/mod.zig");
+
+// Legacy modules (being deprecated)
 pub const types = @import("types.zig");
 pub const dynamics = @import("dynamics.zig");
 pub const gmm = @import("gmm.zig");
@@ -35,13 +41,59 @@ pub const Vec3 = math.Vec3;
 pub const Vec2 = math.Vec2;
 pub const Mat3 = math.Mat3;
 
+// ============================================================================
+// New ECS types (preferred)
+// ============================================================================
+pub const EntityId = ecs.EntityId;
+pub const ECSWorld = ecs.World;
+pub const Position = ecs.Position;
+pub const Velocity = ecs.Velocity;
+pub const Physics = ecs.Physics;
+pub const ECSContactMode = ecs.ContactMode;
+pub const Contact = ecs.Contact;
+pub const Support = ecs.Support;
+pub const ECSLabel = ecs.Label;
+pub const Agency = ecs.Agency;
+
+// SLDS types
+pub const SLDSMatrices = slds.SLDSMatrices;
+pub const SLDSConfig = slds.PhysicsConfig;
+pub const ModeTransitionPrior = slds.ModeTransitionPrior;
+
+// Association types
+pub const Assignment = association.Assignment;
+pub const AssignmentHypotheses = association.AssignmentHypotheses;
+pub const OcclusionGraph = association.OcclusionGraph;
+pub const AssociationConfig = association.AssociationConfig;
+pub const GibbsSampler = association.GibbsSampler;
+
+// CRP types
+pub const CRPConfig = crp.CRPConfig;
+pub const LabelSet = crp.LabelSet;
+pub const BirthProposal = crp.BirthProposal;
+pub const DeathProposal = crp.DeathProposal;
+pub const transDimensionalStep = crp.transDimensionalStep;
+pub const EntityCountPosterior = crp.EntityCountPosterior;
+
+// ============================================================================
+// Legacy types (DEPRECATED - use ECS equivalents above)
+// These will be removed in the next major version.
+// Migration guide:
+//   Entity -> ECSWorld.spawnPhysics() returns EntityId
+//   PhysicsType -> Physics.standard, Physics.bouncy, etc.
+//   ContactMode -> ecs.ContactMode (enum in builtin.zig)
+//   Label -> ecs.Label
+//   TrackState -> ecs.TrackState
+// ============================================================================
 pub const Entity = types.Entity;
 pub const Label = types.Label;
+/// DEPRECATED: Use Physics.standard, Physics.bouncy, etc. instead
 pub const PhysicsType = types.PhysicsType;
 pub const ContactMode = types.ContactMode;
 pub const TrackState = types.TrackState;
 pub const GaussianVec3 = types.GaussianVec3;
 pub const Appearance = types.Appearance;
+/// DEPRECATED: Use SLDSConfig instead
 pub const PhysicsConfig = types.PhysicsConfig;
 pub const Camera = types.Camera;
 pub const ProjectionResult = types.ProjectionResult;
@@ -62,6 +114,11 @@ pub const Observation = gmm.Observation;
 pub const ObservationGrid = gmm.ObservationGrid;
 pub const imageLogLikelihood = gmm.imageLogLikelihood;
 pub const entityLogLikelihood = gmm.entityLogLikelihood;
+
+// Back-projection observation model (conjugate)
+pub const Detection2D = gmm.Detection2D;
+pub const RayGaussian = gmm.RayGaussian;
+pub const backProjectionLogLikelihood = gmm.backProjectionLogLikelihood;
 
 pub const SMCConfig = smc.SMCConfig;
 pub const Particle = smc.Particle;
@@ -244,4 +301,10 @@ test {
     _ = @import("dynamics.zig");
     _ = @import("gmm.zig");
     _ = @import("smc.zig");
+    // New modules
+    _ = @import("ecs/mod.zig");
+    _ = @import("slds/mod.zig");
+    _ = @import("association/mod.zig");
+    _ = @import("crp/mod.zig");
+    _ = @import("smc/mod.zig");
 }

@@ -67,23 +67,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the demo");
     run_step.dependOn(&run_cmd.step);
 
-    // Inference demo executable
-    const inference_exe = b.addExecutable(.{
-        .name = "fizz-inference",
+    // RGB inference demo
+    const rgb_demo = b.addExecutable(.{
+        .name = "rgb-inference",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/inference_demo.zig"),
+            .root_source_file = b.path("src/demo_rgb_inference.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fizz", .module = fizz_mod },
+            },
         }),
     });
-    b.installArtifact(inference_exe);
+    b.installArtifact(rgb_demo);
 
-    const inference_run_cmd = b.addRunArtifact(inference_exe);
-    inference_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        inference_run_cmd.addArgs(args);
-    }
+    const run_rgb = b.addRunArtifact(rgb_demo);
+    run_rgb.step.dependOn(b.getInstallStep());
 
-    const inference_step = b.step("infer", "Run the inference demo");
-    inference_step.dependOn(&inference_run_cmd.step);
+    const rgb_step = b.step("rgb", "Run RGB inference demo");
+    rgb_step.dependOn(&run_rgb.step);
 }

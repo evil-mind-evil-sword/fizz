@@ -1,21 +1,29 @@
-//! Fizz Demo: Generative Physics Simulation
+//! Fizz Demo: ECS-based Generative Physics Simulation
 //!
-//! This demo runs the generative model forward:
-//! - Creates entities with random physics types
-//! - Steps physics with ground collisions
-//! - Renders each frame as GMM observation
+//! This demo uses the new ECS architecture:
+//! - Entities are IDs with component composition
+//! - Physics parameters are continuous (not discrete enum)
+//! - SLDS provides mode-dependent dynamics with Spelke core knowledge priors
 //!
-//! In inference mode (Phase 2+), we would run this backward
-//! using SMC to infer entity properties from observations.
+//! The base system encodes folk physics:
+//! - Objects persist (permanence)
+//! - Objects don't pass through each other (solidity)
+//! - Objects at rest stay at rest (support/stability)
+//! - Some objects are self-propelled (agency)
 
 const std = @import("std");
 const fizz = @import("fizz");
 
 const Vec3 = fizz.Vec3;
-const World = fizz.World;
-const PhysicsConfig = fizz.PhysicsConfig;
-const PhysicsType = fizz.PhysicsType;
-const Camera = fizz.Camera;
+const ECSWorld = fizz.ECSWorld;
+const Physics = fizz.Physics;
+const Position = fizz.Position;
+const Velocity = fizz.Velocity;
+const Contact = fizz.Contact;
+const ContactMode = fizz.ecs.ContactMode;
+const SLDSMatrices = fizz.SLDSMatrices;
+const SLDSConfig = fizz.SLDSConfig;
+const ModeTransitionPrior = fizz.ModeTransitionPrior;
 
 const print = std.debug.print;
 
@@ -24,130 +32,135 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    print("=== Fizz: Probabilistic Physics Engine ===\n\n", .{});
+    print("=== Fizz: ECS-based Probabilistic Physics ===\n\n", .{});
 
-    // Initialize world
-    const config = PhysicsConfig{
+    // Initialize ECS world
+    var world = ECSWorld.init(allocator);
+    defer world.deinit();
+
+    // Physics configurations (replacing old PhysicsType enum)
+    const physics_configs = [_]struct { name: []const u8, physics: Physics, color: Vec3 }{
+        .{ .name = "standard", .physics = Physics.standard, .color = Vec3.init(1.0, 0.3, 0.3) },
+        .{ .name = "bouncy", .physics = Physics.bouncy, .color = Vec3.init(0.3, 1.0, 0.3) },
+        .{ .name = "sticky", .physics = Physics.sticky, .color = Vec3.init(0.3, 0.3, 1.0) },
+        .{ .name = "slippery", .physics = Physics.slippery, .color = Vec3.init(1.0, 1.0, 0.3) },
+    };
+
+    print("Creating entities with ECS:\n", .{});
+
+    for (physics_configs, 0..) |cfg, i| {
+        const x = @as(f32, @floatFromInt(i)) * 2.0 - 3.0;
+        const id = try world.spawnPhysics(
+            Vec3.init(x, 5.0, 0),
+            Vec3.zero,
+            cfg.physics,
+        );
+
+        // Set appearance color
+        if (world.appearances.getMut(id.index)) |app| {
+            app.color = cfg.color;
+            app.radius = 0.5;
+        }
+
+        print("  Entity {d} ({s}): friction={d:.2}, elasticity={d:.2}\n", .{
+            id.index,
+            cfg.name,
+            cfg.physics.friction,
+            cfg.physics.elasticity,
+        });
+    }
+
+    print("\nEntity count: {d}\n", .{world.entityCount()});
+
+    // SLDS configuration
+    const slds_config = SLDSConfig{
         .gravity = Vec3.init(0, -9.81, 0),
         .dt = 1.0 / 60.0,
         .ground_height = 0.0,
     };
 
-    var world = World.init(allocator, config);
-    defer world.deinit();
+    print("\n=== SLDS Mode-Dependent Dynamics ===\n", .{});
 
-    // Initialize RNG
-    var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-    const rng = prng.random();
-
-    // Create entities with different physics types
-    const physics_types = [_]PhysicsType{ .standard, .bouncy, .sticky, .slippery };
-    const colors = [_]Vec3{
-        Vec3.init(1.0, 0.3, 0.3), // Red - standard
-        Vec3.init(0.3, 1.0, 0.3), // Green - bouncy
-        Vec3.init(0.3, 0.3, 1.0), // Blue - sticky
-        Vec3.init(1.0, 1.0, 0.3), // Yellow - slippery
-    };
-
-    print("Creating entities:\n", .{});
-
-    for (physics_types, colors, 0..) |ptype, color, i| {
-        const x = @as(f32, @floatFromInt(i)) * 2.0 - 3.0;
-        const entity = try world.addEntity(
-            Vec3.init(x, 5.0, 0),
-            Vec3.init(0, 0, 0),
-            ptype,
-        );
-        entity.appearance.color = color;
-        entity.appearance.radius = 0.5; // Larger radius for better visibility
-
-        print("  Entity {d}: {s} at ({d:.2}, {d:.2}, {d:.2})\n", .{
-            i,
-            @tagName(ptype),
-            x,
-            @as(f32, 5.0),
-            @as(f32, 0.0),
-        });
+    // Demonstrate SLDS matrices for different modes
+    const modes = [_]ContactMode{ .free, .ground, .supported, .agency };
+    for (modes) |mode| {
+        const matrices = SLDSMatrices.forMode(mode, Physics.standard, slds_config);
+        print("\n  Mode: {s}\n", .{@tagName(mode)});
+        print("    Gravity effect (b[4]): {d:.4}\n", .{matrices.b[4]});
+        print("    Position noise Q[0,0]: {d:.6}\n", .{matrices.Q.get(0, 0)});
     }
 
-    print("\nRunning simulation ({d} steps):\n", .{180});
+    print("\n=== Mode Transition Priors (Spelke Core Knowledge) ===\n", .{});
 
-    // Camera for rendering
-    const camera = Camera{
-        .position = Vec3.init(0, 3, 10),
-        .target = Vec3.init(0, 2, 0),
-        .up = Vec3.unit_y,
-        .fov = std.math.pi / 4.0,
-        .aspect = 1.0,
-        .near = 0.1,
-        .far = 100.0,
-    };
+    // Demonstrate mode transition probabilities
+    print("\n  From GROUND mode, low speed (stability prior):\n", .{});
+    const stay_ground = ModeTransitionPrior.transitionProb(.ground, .ground, false, 0.01);
+    const leave_ground = ModeTransitionPrior.transitionProb(.ground, .free, false, 0.01);
+    print("    P(stay on ground) = {d:.3}\n", .{stay_ground});
+    print("    P(leave ground)   = {d:.3}\n", .{leave_ground});
+    print("    => Objects at rest tend to stay at rest\n", .{});
 
-    // Simulation loop
-    var frame: u32 = 0;
-    const total_frames: u32 = 180; // 3 seconds at 60 FPS
+    print("\n  From FREE mode, contact detected:\n", .{});
+    const land = ModeTransitionPrior.transitionProb(.free, .ground, true, 0.5);
+    const bounce = ModeTransitionPrior.transitionProb(.free, .free, true, 0.5);
+    print("    P(land on ground) = {d:.3}\n", .{land});
+    print("    P(bounce off)     = {d:.3}\n", .{bounce});
 
-    while (frame < total_frames) : (frame += 1) {
-        // Step physics (generative, with process noise)
-        world.step(rng);
+    print("\n=== Entity Queries ===\n", .{});
 
-        // Print status every 30 frames (0.5 seconds)
-        if (frame % 30 == 0) {
-            print("\n  Frame {d}/{d}:\n", .{ frame, total_frames });
-
-            for (world.entities.items, 0..) |entity, i| {
-                const pos = entity.positionMean();
-                const vel = entity.velocityMean();
-                print("    Entity {d}: pos=({d:.2}, {d:.2}, {d:.2}) vel=({d:.2}, {d:.2}, {d:.2}) contact={s}\n", .{
-                    i,
-                    pos.x,
-                    pos.y,
-                    pos.z,
-                    vel.x,
-                    vel.y,
-                    vel.z,
-                    @tagName(entity.contact_mode),
+    // Query physics entities
+    var phys_count: usize = 0;
+    var query = world.queryPhysicsEntities();
+    while (query.next()) |id| {
+        if (world.getPosition(id)) |pos| {
+            if (world.getPhysics(id)) |phys| {
+                print("  Entity {d}: pos=({d:.1}, {d:.1}, {d:.1}) friction={d:.2}\n", .{
+                    id.index,
+                    pos.mean.x,
+                    pos.mean.y,
+                    pos.mean.z,
+                    phys.friction,
                 });
             }
-
-            // Render to GMM and compute observation (64 samples for proper coverage)
-            var obs_grid = try world.render(camera, 8, 8, 64);
-            defer obs_grid.deinit();
-
-            // Count occupied pixels
-            var occupied_count: u32 = 0;
-            for (obs_grid.pixels) |pixel| {
-                if (pixel.occupied) occupied_count += 1;
-            }
-
-            print("    Observation: {d}/64 pixels occupied\n", .{occupied_count});
         }
+        phys_count += 1;
     }
+    print("  Total physics entities: {d}\n", .{phys_count});
 
-    print("\n=== Simulation Complete ===\n", .{});
-    print("\nFinal entity states:\n", .{});
-
-    for (world.entities.items, 0..) |entity, i| {
-        const pos = entity.positionMean();
-        print("  Entity {d} ({s}): final_y = {d:.3}, contact = {s}\n", .{
-            i,
-            @tagName(entity.physics_type),
-            pos.y,
-            @tagName(entity.contact_mode),
-        });
+    // Query agents (none yet)
+    var agent_query = world.queryAgents();
+    var agent_count: usize = 0;
+    while (agent_query.next()) |_| {
+        agent_count += 1;
     }
+    print("  Total agent entities: {d}\n", .{agent_count});
 
-    // Summary of physics behavior
-    print("\nExpected behaviors:\n", .{});
-    print("  - standard: moderate bounce, settles quickly\n", .{});
-    print("  - bouncy: high bounce, takes longer to settle\n", .{});
-    print("  - sticky: minimal bounce, settles immediately\n", .{});
-    print("  - slippery: moderate bounce, may slide on ground\n", .{});
+    // Spawn an agent to demonstrate
+    print("\n=== Spawning Agent Entity ===\n", .{});
+    const agent_id = try world.spawnAgent(
+        Vec3.init(0, 3, 2),
+        Vec3.init(1, 0, 0),
+        Physics.standard,
+    );
+    print("  Created agent entity {d}\n", .{agent_id.index});
+    print("  Has Agency component: {}\n", .{world.hasAgency(agent_id)});
 
-    print("\n=== Phase 1 Complete ===\n", .{});
-    print("Next: Phase 2 - SMC inference to infer physics types from observations\n", .{});
+    // Show agent dynamics have higher noise
+    const agent_matrices = SLDSMatrices.forMode(.agency, Physics.standard, slds_config);
+    const free_matrices = SLDSMatrices.forMode(.free, Physics.standard, slds_config);
+    print("  Agency mode noise: {d:.6}\n", .{agent_matrices.Q.get(0, 0)});
+    print("  Free mode noise:   {d:.6}\n", .{free_matrices.Q.get(0, 0)});
+    print("  => Agents are less predictable (Spelke: agency detection)\n", .{});
+
+    print("\n=== ECS Demo Complete ===\n", .{});
+    print("\nArchitecture:\n", .{});
+    print("  - Entities: generational IDs with component composition\n", .{});
+    print("  - Components: Position, Velocity, Physics, Contact, Agency\n", .{});
+    print("  - Systems: Global programs querying by component signature\n", .{});
+    print("  - SLDS: Mode-dependent dynamics with folk physics priors\n", .{});
+    print("\nNext: Integrate with SMC inference pipeline\n", .{});
 }
 
-test "main runs without error" {
-    // Just verify it compiles - actual test would need to capture output
+test "main compiles" {
+    // Verify compilation
 }

@@ -4,6 +4,23 @@ const Vec3 = math.Vec3;
 const Mat3 = math.Mat3;
 
 // =============================================================================
+// Entity Identification
+// =============================================================================
+
+/// Entity identifier - compatible with both ecs.World and ParticleWorldView
+/// This is the canonical definition used throughout the codebase
+pub const EntityId = struct {
+    index: u32,
+    generation: u16 = 0,
+
+    pub const invalid = EntityId{ .index = std.math.maxInt(u32), .generation = 0 };
+
+    pub fn eql(self: EntityId, other: EntityId) bool {
+        return self.index == other.index and self.generation == other.generation;
+    }
+};
+
+// =============================================================================
 // Entity Labels and Identification
 // =============================================================================
 
@@ -28,6 +45,8 @@ pub const TrackState = enum(u8) {
     detected,
     /// Not matched but predicted to exist (occlusion)
     occluded,
+    /// Tentative - newly born, needs confirmation
+    tentative,
     /// Marked for removal
     dead,
 };
@@ -89,6 +108,65 @@ pub const ContactMode = enum(u8) {
     wall,
     /// Contact with another entity
     entity,
+};
+
+/// Goal type - discrete variable for agent behavior
+/// Core knowledge: Agents have goals that persist and guide behavior
+pub const GoalType = enum(u8) {
+    /// No active goal (object-like behavior)
+    none,
+    /// Move toward target position
+    reach,
+    /// Follow/pursue target entity
+    track,
+    /// Move away from target entity
+    avoid,
+    /// Approach and make contact with target
+    acquire,
+
+    /// Returns true if this goal type requires a target entity
+    pub fn requiresTarget(self: GoalType) bool {
+        return switch (self) {
+            .none, .reach => false,
+            .track, .avoid, .acquire => true,
+        };
+    }
+
+    /// Returns true if this goal type requires a target position
+    pub fn requiresPosition(self: GoalType) bool {
+        return self == .reach;
+    }
+};
+
+/// Spatial relation type - discrete variable for geometric relationships
+/// Core knowledge: Space/geometry (containment, support, relative positions)
+pub const SpatialRelationType = enum(u8) {
+    /// No spatial relation specified
+    none,
+    /// Inside a container (containment)
+    inside,
+    /// On top of / supported by
+    on,
+    /// Near another entity (proximity)
+    near,
+    /// Left of reference entity (requires known viewpoint)
+    left_of,
+    /// Right of reference entity (requires known viewpoint)
+    right_of,
+    /// Above reference entity
+    above,
+    /// Below reference entity
+    below,
+
+    /// Returns true if this relation requires a reference entity
+    pub fn requiresReference(self: SpatialRelationType) bool {
+        return self != .none;
+    }
+
+    /// Returns true if this relation is viewpoint-dependent
+    pub fn isViewpointDependent(self: SpatialRelationType) bool {
+        return self == .left_of or self == .right_of;
+    }
 };
 
 // =============================================================================
@@ -279,6 +357,110 @@ pub const ProjectionResult = struct {
     ndc: math.Vec2,
     /// Depth (distance along view axis)
     depth: f32,
+};
+
+// =============================================================================
+// Camera Pose (for FastSLAM - sampled per particle)
+// =============================================================================
+
+/// Camera pose state (sampled in particles)
+/// Gravity constrains pitch/roll, so only position + yaw are free
+pub const CameraPose = struct {
+    /// Camera position in world coordinates
+    position: Vec3,
+    /// Yaw angle (rotation around Y/up axis, in radians)
+    /// 0 = looking along -Z, positive = counter-clockwise from above
+    yaw: f32,
+
+    pub const default = CameraPose{
+        .position = Vec3.init(0, 5, 10),
+        .yaw = 0,
+    };
+
+    /// Create camera pose from position and yaw
+    pub fn init(position: Vec3, yaw: f32) CameraPose {
+        return .{ .position = position, .yaw = yaw };
+    }
+
+    /// Get forward direction (where camera looks)
+    pub fn forward(self: CameraPose) Vec3 {
+        // Yaw rotates around Y axis
+        // At yaw=0, looking along -Z
+        const cos_yaw = @cos(self.yaw);
+        const sin_yaw = @sin(self.yaw);
+        return Vec3.init(-sin_yaw, 0, -cos_yaw);
+    }
+
+    /// Get right direction
+    pub fn right(self: CameraPose) Vec3 {
+        const cos_yaw = @cos(self.yaw);
+        const sin_yaw = @sin(self.yaw);
+        return Vec3.init(cos_yaw, 0, -sin_yaw);
+    }
+
+    /// Get up direction (always world up due to gravity constraint)
+    pub fn up(self: CameraPose) Vec3 {
+        _ = self;
+        return Vec3.unit_y;
+    }
+
+    /// Convert to full Camera with given intrinsics
+    pub fn toCamera(self: CameraPose, intrinsics: CameraIntrinsics) Camera {
+        const fwd = self.forward();
+        return .{
+            .position = self.position,
+            .target = self.position.add(fwd),
+            .up = Vec3.unit_y,
+            .fov = intrinsics.fov,
+            .aspect = intrinsics.aspect,
+            .near = intrinsics.near,
+            .far = intrinsics.far,
+        };
+    }
+
+    /// Sample from prior (uniform in bounds)
+    pub fn samplePrior(
+        position_min: Vec3,
+        position_max: Vec3,
+        yaw_min: f32,
+        yaw_max: f32,
+        rng: std.Random,
+    ) CameraPose {
+        return .{
+            .position = Vec3.init(
+                position_min.x + rng.float(f32) * (position_max.x - position_min.x),
+                position_min.y + rng.float(f32) * (position_max.y - position_min.y),
+                position_min.z + rng.float(f32) * (position_max.z - position_min.z),
+            ),
+            .yaw = yaw_min + rng.float(f32) * (yaw_max - yaw_min),
+        };
+    }
+
+    /// Apply random walk dynamics
+    pub fn step(self: CameraPose, position_noise: f32, yaw_noise: f32, rng: std.Random) CameraPose {
+        return .{
+            .position = Vec3.init(
+                self.position.x + sampleStdNormal(rng) * position_noise,
+                self.position.y + sampleStdNormal(rng) * position_noise,
+                self.position.z + sampleStdNormal(rng) * position_noise,
+            ),
+            .yaw = self.yaw + sampleStdNormal(rng) * yaw_noise,
+        };
+    }
+};
+
+/// Camera intrinsic parameters (fixed, not inferred)
+pub const CameraIntrinsics = struct {
+    /// Field of view (radians)
+    fov: f32 = std.math.pi / 4.0,
+    /// Aspect ratio (width/height)
+    aspect: f32 = 1.0,
+    /// Near clip plane
+    near: f32 = 0.1,
+    /// Far clip plane
+    far: f32 = 100.0,
+
+    pub const default = CameraIntrinsics{};
 };
 
 /// Camera parameters for projection

@@ -142,6 +142,18 @@ typedef struct {
     float prob_slippery;
 } FizzPosterior;
 
+/** Camera belief (posterior over agent's pose). */
+typedef struct {
+    float mean_pos_x;
+    float mean_pos_y;
+    float mean_pos_z;
+    float mean_yaw;       /**< Mean yaw in radians */
+    float var_pos_x;
+    float var_pos_y;
+    float var_pos_z;
+    float var_yaw;
+} FizzCameraBelief;
+
 /* ==========================================================================
  * Default Configuration Helpers
  * ========================================================================== */
@@ -346,6 +358,23 @@ FizzError fizz_smc_step_with_world(
     const FizzCamera* camera);
 
 /**
+ * Step SMC inference with an RGB image observation.
+ * Primary API for external renderers (SwiftUI, GTK, etc).
+ * The image represents what the agent "sees" from an unknown camera position.
+ * FastSLAM pattern: each particle has its own camera hypothesis.
+ * @param smc SMC handle
+ * @param rgb_data RGB24 pixel data (row-major, 3 bytes per pixel)
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @return FIZZ_OK on success
+ */
+FizzError fizz_smc_step_with_image(
+    FizzSMC* smc,
+    const uint8_t* rgb_data,
+    uint32_t width,
+    uint32_t height);
+
+/**
  * Get number of entities tracked by SMC.
  * @param smc SMC handle
  * @return Number of tracked entities
@@ -377,6 +406,32 @@ float fizz_smc_get_ess(FizzSMC* smc);
  * @return Current temperature value
  */
 float fizz_smc_get_temperature(FizzSMC* smc);
+
+/**
+ * Get camera belief (posterior over agent's pose).
+ * FastSLAM pattern: agent doesn't know where it is, infers from observations.
+ * @param smc SMC handle
+ * @param out Output camera belief struct
+ * @return FIZZ_OK on success
+ */
+FizzError fizz_smc_get_camera_belief(FizzSMC* smc, FizzCameraBelief* out);
+
+/**
+ * Get MAP (maximum a posteriori) camera pose.
+ * Returns the camera pose from the highest-weight particle.
+ * @param smc SMC handle
+ * @param out_x Output X position
+ * @param out_y Output Y position
+ * @param out_z Output Z position
+ * @param out_yaw Output yaw angle (radians)
+ * @return FIZZ_OK on success
+ */
+FizzError fizz_smc_get_camera_map(
+    FizzSMC* smc,
+    float* out_x,
+    float* out_y,
+    float* out_z,
+    float* out_yaw);
 
 /* ==========================================================================
  * Version Info

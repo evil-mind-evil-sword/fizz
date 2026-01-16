@@ -61,10 +61,10 @@ defer smc.deinit();
 // Initialize with observed positions (unknown physics types)
 try smc.initializeWithPrior(&positions, &velocities);
 
-// Run inference loop
+// Run inference loop (camera is inferred, not passed)
 while (running) {
     const observation = world.render(camera, 16, 16, 32);
-    try smc.step(observation, camera);
+    try smc.step(observation);
 }
 
 // Get posterior estimates

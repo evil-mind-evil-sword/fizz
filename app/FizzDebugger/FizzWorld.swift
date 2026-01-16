@@ -120,3 +120,117 @@ final class FizzWorldWrapper {
         entities = newEntities
     }
 }
+
+// MARK: - SMC Inference Wrapper
+
+/// Swift wrapper for FizzSMC C API (FastSLAM inference)
+@MainActor
+@Observable
+final class FizzSMCWrapper {
+    private nonisolated(unsafe) var smc: OpaquePointer?
+
+    private(set) var posteriors: [[Float]] = []  // [entity_idx][physics_type]
+    private(set) var cameraBelief: CameraBelief = .init()
+    private(set) var ess: Float = 0
+    private(set) var temperature: Float = 0
+    private(set) var entityCount: UInt32 = 0
+
+    struct CameraBelief {
+        var meanPosition: SIMD3<Float> = .zero
+        var meanYaw: Float = 0
+        var positionVariance: SIMD3<Float> = .zero
+        var yawVariance: Float = 0
+    }
+
+    struct EntityPosterior: Identifiable {
+        let id: Int
+        var standard: Float
+        var bouncy: Float
+        var sticky: Float
+        var slippery: Float
+
+        var mostLikely: FizzWorldWrapper.PhysicsType {
+            let probs = [standard, bouncy, sticky, slippery]
+            let maxIdx = probs.enumerated().max(by: { $0.1 < $1.1 })?.0 ?? 0
+            return FizzWorldWrapper.PhysicsType(rawValue: UInt32(maxIdx)) ?? .standard
+        }
+    }
+
+    init() {
+        var physicsConfig = fizz_physics_config_default()
+        var smcConfig = fizz_smc_config_default()
+        smcConfig.num_particles = 50
+        smc = fizz_smc_create(&physicsConfig, &smcConfig)
+    }
+
+    deinit {
+        fizz_smc_destroy(smc)
+    }
+
+    /// Initialize SMC with observed entity positions
+    func initWithPrior(positions: [SIMD3<Float>], velocities: [SIMD3<Float>]) {
+        let posVecs = positions.map { FizzVec3(x: $0.x, y: $0.y, z: $0.z) }
+        let velVecs = velocities.map { FizzVec3(x: $0.x, y: $0.y, z: $0.z) }
+
+        posVecs.withUnsafeBufferPointer { posPtr in
+            velVecs.withUnsafeBufferPointer { velPtr in
+                _ = fizz_smc_init_prior(smc, posPtr.baseAddress, velPtr.baseAddress, UInt32(positions.count))
+            }
+        }
+
+        refreshState()
+    }
+
+    /// Step inference with RGB image observation
+    func stepWithImage(rgbData: [UInt8], width: UInt32, height: UInt32) {
+        rgbData.withUnsafeBufferPointer { ptr in
+            _ = fizz_smc_step_with_image(smc, ptr.baseAddress, width, height)
+        }
+        refreshState()
+    }
+
+    /// Get posteriors as structured array
+    var entityPosteriors: [EntityPosterior] {
+        posteriors.enumerated().map { idx, probs in
+            EntityPosterior(
+                id: idx,
+                standard: probs.count > 0 ? probs[0] : 0,
+                bouncy: probs.count > 1 ? probs[1] : 0,
+                sticky: probs.count > 2 ? probs[2] : 0,
+                slippery: probs.count > 3 ? probs[3] : 0
+            )
+        }
+    }
+
+    /// Refresh all state from C API
+    private func refreshState() {
+        // Get posteriors
+        entityCount = fizz_smc_entity_count(smc)
+        var posteriorArray = [FizzPosterior](repeating: FizzPosterior(), count: Int(entityCount))
+        let written = posteriorArray.withUnsafeMutableBufferPointer { ptr in
+            fizz_smc_get_posteriors(smc, ptr.baseAddress, entityCount)
+        }
+
+        posteriors = (0..<written).map { i in
+            [posteriorArray[Int(i)].prob_standard,
+             posteriorArray[Int(i)].prob_bouncy,
+             posteriorArray[Int(i)].prob_sticky,
+             posteriorArray[Int(i)].prob_slippery]
+        }
+
+        // Get camera belief
+        var belief = FizzCameraBelief()
+        if fizz_smc_get_camera_belief(smc, &belief) == FIZZ_OK {
+            cameraBelief = CameraBelief(
+                meanPosition: SIMD3(belief.mean_pos_x, belief.mean_pos_y, belief.mean_pos_z),
+                meanYaw: belief.mean_yaw,
+                positionVariance: SIMD3(belief.var_pos_x, belief.var_pos_y, belief.var_pos_z),
+                yawVariance: belief.var_yaw
+            )
+        }
+
+        // Get ESS and temperature
+        ess = fizz_smc_get_ess(smc)
+        temperature = fizz_smc_get_temperature(smc)
+    }
+}

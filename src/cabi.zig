@@ -426,7 +426,7 @@ export fn fizz_smc_init_prior(
         vel_slice[i] = Vec3.init(velocities[i].x, velocities[i].y, velocities[i].z);
     }
 
-    state.smc.initializeWithPrior(pos_slice, vel_slice) catch return .out_of_memory;
+    state.smc.initializeWithPrior(pos_slice, vel_slice);
     return .ok;
 }
 
@@ -458,16 +458,60 @@ export fn fizz_smc_step_with_world(
     }
     smc_internal.observation = observation;
 
+    // Step SMC (camera is no longer passed - each particle has its own camera hypothesis)
+    smc_internal.smc.step(observation) catch return .out_of_memory;
+    return .ok;
+}
+
+/// Step SMC inference with an RGB image observation.
+/// This is the primary API for external renderers (SwiftUI, GTK, etc).
+/// The image should match what the agent "sees" from an unknown camera position.
+export fn fizz_smc_step_with_image(
+    smc_ptr: ?*FizzSMC,
+    rgb_data: [*]const u8,
+    width: u32,
+    height: u32,
+) FizzError {
+    const smc_internal = smcState(smc_ptr) orelse return .invalid_handle;
+
+    // Create observation grid from RGB data
+    var observation = ObservationGrid.init(width, height, smc_internal.allocator) catch return .out_of_memory;
+
+    // Convert RGB bytes to observation pixels
+    for (0..height) |yi| {
+        for (0..width) |xi| {
+            const x: u32 = @intCast(xi);
+            const y: u32 = @intCast(yi);
+            const idx = (yi * width + xi) * 3;
+
+            const r = @as(f32, @floatFromInt(rgb_data[idx])) / 255.0;
+            const g = @as(f32, @floatFromInt(rgb_data[idx + 1])) / 255.0;
+            const b = @as(f32, @floatFromInt(rgb_data[idx + 2])) / 255.0;
+
+            observation.set(x, y, .{
+                .color = Vec3.init(r, g, b),
+                .depth = std.math.inf(f32), // Unknown depth
+                .occupied = r > 0.01 or g > 0.01 or b > 0.01, // Non-black = occupied
+            });
+        }
+    }
+
+    // Free previous observation
+    if (smc_internal.observation) |*obs| {
+        obs.deinit();
+    }
+    smc_internal.observation = observation;
+
     // Step SMC
-    smc_internal.smc.step(observation, zig_camera) catch return .out_of_memory;
+    smc_internal.smc.step(observation) catch return .out_of_memory;
     return .ok;
 }
 
 /// Get number of entities tracked by SMC.
 export fn fizz_smc_entity_count(smc_ptr: ?*FizzSMC) u32 {
     const state = smcState(smc_ptr) orelse return 0;
-    if (state.smc.particles.len == 0) return 0;
-    return @intCast(state.smc.particles[0].entities.items.len);
+    if (state.smc.swarm.num_particles == 0) return 0;
+    return state.smc.swarm.entity_counts[0];
 }
 
 /// Get physics type posteriors for all entities.
@@ -503,6 +547,54 @@ export fn fizz_smc_get_ess(smc_ptr: ?*FizzSMC) f32 {
 export fn fizz_smc_get_temperature(smc_ptr: ?*FizzSMC) f32 {
     const state = smcState(smc_ptr) orelse return 0;
     return state.smc.temperature;
+}
+
+/// Camera belief (posterior over camera pose).
+pub const FizzCameraBelief = extern struct {
+    /// Mean position
+    mean_pos_x: f32,
+    mean_pos_y: f32,
+    mean_pos_z: f32,
+    /// Mean yaw (radians)
+    mean_yaw: f32,
+    /// Position variance (diagonal)
+    var_pos_x: f32,
+    var_pos_y: f32,
+    var_pos_z: f32,
+    /// Yaw variance
+    var_yaw: f32,
+};
+
+/// Get camera belief (posterior over agent's pose).
+export fn fizz_smc_get_camera_belief(smc_ptr: ?*FizzSMC, out: *FizzCameraBelief) FizzError {
+    const state = smcState(smc_ptr) orelse return .invalid_handle;
+    const belief = state.smc.getCameraBelief();
+
+    out.* = .{
+        .mean_pos_x = belief.mean_position.x,
+        .mean_pos_y = belief.mean_position.y,
+        .mean_pos_z = belief.mean_position.z,
+        .mean_yaw = belief.mean_yaw,
+        .var_pos_x = belief.position_variance.x,
+        .var_pos_y = belief.position_variance.y,
+        .var_pos_z = belief.position_variance.z,
+        .var_yaw = belief.yaw_variance,
+    };
+
+    return .ok;
+}
+
+/// Get MAP (maximum a posteriori) camera pose.
+export fn fizz_smc_get_camera_map(smc_ptr: ?*FizzSMC, out_x: *f32, out_y: *f32, out_z: *f32, out_yaw: *f32) FizzError {
+    const state = smcState(smc_ptr) orelse return .invalid_handle;
+    const map_pose = state.smc.getCameraPoseMAP();
+
+    out_x.* = map_pose.position.x;
+    out_y.* = map_pose.position.y;
+    out_z.* = map_pose.position.z;
+    out_yaw.* = map_pose.yaw;
+
+    return .ok;
 }
 
 // =============================================================================
