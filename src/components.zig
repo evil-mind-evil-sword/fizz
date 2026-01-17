@@ -123,36 +123,6 @@ pub const Velocity = struct {
 // Physics Parameters
 // =============================================================================
 
-/// Physics type - discrete variable for Gibbs sampling
-pub const PhysicsType = enum(u8) {
-    standard,
-    bouncy,
-    sticky,
-    slippery,
-
-    /// Get continuous parameters for this physics type
-    pub fn params(self: PhysicsType) PhysicsParams {
-        return switch (self) {
-            .standard => PhysicsParams.standard,
-            .bouncy => PhysicsParams.bouncy,
-            .sticky => PhysicsParams.sticky,
-            .slippery => PhysicsParams.slippery,
-        };
-    }
-
-    pub fn friction(self: PhysicsType) f32 {
-        return self.params().friction;
-    }
-
-    pub fn elasticity(self: PhysicsType) f32 {
-        return self.params().elasticity;
-    }
-
-    pub fn processNoise(self: PhysicsType) f32 {
-        return self.params().process_noise;
-    }
-};
-
 /// Physics parameters - continuous values for dynamics computation
 pub const PhysicsParams = struct {
     friction: f32,
@@ -462,9 +432,9 @@ test "Position component" {
     try std.testing.expect(pos.cov.get(0, 0) == 0.001);
 }
 
-test "PhysicsType params lookup" {
-    try std.testing.expect(PhysicsType.bouncy.elasticity() > PhysicsType.sticky.elasticity());
-    try std.testing.expect(PhysicsType.sticky.friction() > PhysicsType.slippery.friction());
+test "PhysicsParams presets" {
+    try std.testing.expect(PhysicsParams.bouncy.elasticity > PhysicsParams.sticky.elasticity);
+    try std.testing.expect(PhysicsParams.sticky.friction > PhysicsParams.slippery.friction);
 }
 
 test "ContactMode values" {

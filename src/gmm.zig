@@ -5,6 +5,7 @@ const types = @import("types.zig");
 const Vec3 = math.Vec3;
 const Vec2 = math.Vec2;
 const Mat3 = math.Mat3;
+const Mat2 = math.Mat2;
 const Entity = types.Entity;
 const GaussianVec3 = types.GaussianVec3;
 const Camera = types.Camera;
@@ -326,8 +327,10 @@ pub const ObservationGrid = struct {
                 const y: u32 = @intCast(yi);
 
                 // Convert pixel to NDC
+                // Image coords: (0,0) top-left, Y increases downward
+                // NDC coords: (-1,-1) bottom-left, Y increases upward
                 const ndc_x = (@as(f32, @floatFromInt(x)) - half_w) / half_w;
-                const ndc_y = (@as(f32, @floatFromInt(y)) - half_h) / half_h;
+                const ndc_y = (half_h - @as(f32, @floatFromInt(y))) / half_h; // Flip Y
 
                 // Ray march through scene
                 const ray_dir = computeRayDirection(camera, ndc_x, ndc_y);
@@ -336,6 +339,47 @@ pub const ObservationGrid = struct {
                 self.set(x, y, obs);
             }
         }
+    }
+
+    /// Write observation grid to binary PPM file (P6 format)
+    pub fn writePPM(self: ObservationGrid, path: []const u8) !void {
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        // PPM header: P6 (binary RGB)
+        var header_buf: [64]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "P6\n{d} {d}\n255\n", .{ self.width, self.height }) catch unreachable;
+        try file.writeAll(header);
+
+        // Write pixel data (RGB bytes) - collect into buffer for efficiency
+        const pixel_count = @as(usize, self.width) * self.height * 3;
+        var pixel_data = self.allocator.alloc(u8, pixel_count) catch {
+            // Fallback to unbuffered writes if allocation fails
+            for (0..self.height) |yi| {
+                for (0..self.width) |xi| {
+                    const obs = self.get(@intCast(xi), @intCast(yi));
+                    const r: u8 = @intFromFloat(@min(255.0, @max(0.0, obs.color.x * 255.0)));
+                    const g: u8 = @intFromFloat(@min(255.0, @max(0.0, obs.color.y * 255.0)));
+                    const b: u8 = @intFromFloat(@min(255.0, @max(0.0, obs.color.z * 255.0)));
+                    try file.writeAll(&[_]u8{ r, g, b });
+                }
+            }
+            return;
+        };
+        defer self.allocator.free(pixel_data);
+
+        var idx: usize = 0;
+        for (0..self.height) |yi| {
+            for (0..self.width) |xi| {
+                const obs = self.get(@intCast(xi), @intCast(yi));
+                pixel_data[idx] = @intFromFloat(@min(255.0, @max(0.0, obs.color.x * 255.0)));
+                pixel_data[idx + 1] = @intFromFloat(@min(255.0, @max(0.0, obs.color.y * 255.0)));
+                pixel_data[idx + 2] = @intFromFloat(@min(255.0, @max(0.0, obs.color.z * 255.0)));
+                idx += 3;
+            }
+        }
+
+        try file.writeAll(pixel_data);
     }
 };
 
@@ -595,10 +639,11 @@ pub const RayGaussian = struct {
         depth_prior_var: f32,
     ) RayGaussian {
         // Convert pixel to NDC
+        // Image: Y increases downward, NDC: Y increases upward
         const half_w: f32 = @floatFromInt(image_width / 2);
         const half_h: f32 = @floatFromInt(image_height / 2);
         const ndc_x = (detection.pixel_x - half_w) / half_w;
-        const ndc_y = (detection.pixel_y - half_h) / half_h;
+        const ndc_y = (half_h - detection.pixel_y) / half_h; // Flip Y
 
         // Compute ray direction
         const ray_dir = computeRayDirection(camera, ndc_x, ndc_y);
@@ -700,6 +745,398 @@ fn outerProduct(v: Vec3, w: Vec3) Mat3 {
         },
     };
 }
+
+// =============================================================================
+// OPTICAL FLOW OBSERVATION MODEL
+// =============================================================================
+//
+// Sparse optical flow between consecutive detection centroids provides
+// VELOCITY observations that complement the POSITION observations from
+// blob detection. Together they constrain the full (position, velocity) state.
+//
+// ## Mathematical Foundation
+//
+// Lucas-Kanade optical flow assumes brightness constancy:
+//     I(x, y, t) = I(x + dx, y + dy, t + dt)
+//
+// Linearizing gives the optical flow constraint:
+//     Ix * u + Iy * v + It = 0
+//
+// where (Ix, Iy) are spatial gradients, It is temporal gradient,
+// and (u, v) is the flow velocity.
+//
+// ## Heteroscedastic Covariance (arXiv:2010.06871)
+//
+// The uncertainty of Lucas-Kanade flow depends on local image texture.
+// The structure tensor M = [[Ix², IxIy], [IxIy, Iy²]] captures this:
+// - High eigenvalues → strong texture → low uncertainty
+// - Low eigenvalues → weak texture (aperture problem) → high uncertainty
+//
+// Covariance is inversely proportional to the structure tensor:
+//     Σ_flow ∝ M⁻¹
+//
+// This provides heteroscedastic (texture-dependent) noise estimation.
+//
+// ## Conjugacy
+//
+// Flow observation is Gaussian: p(observed_flow | true_velocity) = N(H*v, Σ)
+// where H projects 3D velocity to 2D image plane.
+// Combined with Gaussian velocity prior → Gaussian posterior (conjugate).
+// =============================================================================
+
+/// Sparse optical flow observation between two consecutive frames
+/// Used for velocity estimation in SMC inference
+pub const FlowObservation = struct {
+    /// Index of detection in previous frame
+    prev_detection_idx: usize,
+    /// Index of matched detection in current frame
+    curr_detection_idx: usize,
+    /// Optical flow (dx, dy) in pixels
+    flow: Vec2,
+    /// Heteroscedastic covariance (texture-dependent uncertainty)
+    covariance: Mat2,
+    /// Confidence weight (based on structure tensor eigenvalues)
+    weight: f32,
+
+    /// Compute log-likelihood of this flow observation given projected velocity
+    pub fn logLikelihood(self: FlowObservation, projected_velocity: Vec2) f32 {
+        const residual = self.flow.sub(projected_velocity);
+        const inv_cov = self.covariance.inverse() orelse return -std.math.inf(f32);
+        const mahal = residual.dot(inv_cov.mulVec(residual));
+        const log_det = @log(self.covariance.determinant() + 1e-10);
+        return -0.5 * mahal - 0.5 * log_det;
+    }
+};
+
+/// Compute structure tensor at a pixel location
+/// The structure tensor captures local image gradient statistics:
+///     M = Σ_window [[Ix², IxIy], [IxIy, Iy²]]
+///
+/// This determines the reliability of optical flow estimation.
+fn structureTensor(
+    grid: ObservationGrid,
+    x: u32,
+    y: u32,
+    window_size: u32,
+) Mat2 {
+    var sum_ix_ix: f32 = 0;
+    var sum_ix_iy: f32 = 0;
+    var sum_iy_iy: f32 = 0;
+
+    const half_w = window_size / 2;
+    const width = grid.width;
+    const height = grid.height;
+
+    // Compute structure tensor over local window
+    var wy: u32 = 0;
+    while (wy < window_size) : (wy += 1) {
+        const py = @as(i32, @intCast(y)) - @as(i32, @intCast(half_w)) + @as(i32, @intCast(wy));
+        if (py < 1 or py >= @as(i32, @intCast(height)) - 1) continue;
+
+        var wx: u32 = 0;
+        while (wx < window_size) : (wx += 1) {
+            const px = @as(i32, @intCast(x)) - @as(i32, @intCast(half_w)) + @as(i32, @intCast(wx));
+            if (px < 1 or px >= @as(i32, @intCast(width)) - 1) continue;
+
+            const ux = @as(u32, @intCast(px));
+            const uy = @as(u32, @intCast(py));
+
+            // Compute spatial gradients using Sobel-like kernel
+            const left = grid.get(ux - 1, uy);
+            const right = grid.get(ux + 1, uy);
+            const up = grid.get(ux, uy - 1);
+            const down = grid.get(ux, uy + 1);
+
+            // Gradient on brightness (average of RGB)
+            const b_left = (left.color.x + left.color.y + left.color.z) / 3.0;
+            const b_right = (right.color.x + right.color.y + right.color.z) / 3.0;
+            const b_up = (up.color.x + up.color.y + up.color.z) / 3.0;
+            const b_down = (down.color.x + down.color.y + down.color.z) / 3.0;
+
+            const ix = (b_right - b_left) / 2.0;
+            const iy = (b_down - b_up) / 2.0;
+
+            sum_ix_ix += ix * ix;
+            sum_ix_iy += ix * iy;
+            sum_iy_iy += iy * iy;
+        }
+    }
+
+    return Mat2.init(sum_ix_ix, sum_ix_iy, sum_ix_iy, sum_iy_iy);
+}
+
+/// Compute Lucas-Kanade optical flow at a detection centroid
+/// Returns the flow vector and its heteroscedastic covariance
+fn lucasKanadeAtPoint(
+    prev_grid: ObservationGrid,
+    curr_grid: ObservationGrid,
+    x: u32,
+    y: u32,
+    window_size: u32,
+    noise_floor: f32,
+) struct { flow: Vec2, covariance: Mat2, weight: f32 } {
+    // Compute structure tensor from previous frame
+    const M = structureTensor(prev_grid, x, y, window_size);
+
+    // Check if structure tensor is invertible (sufficient texture)
+    const det = M.determinant();
+    const trace = M.get(0, 0) + M.get(1, 1);
+    const min_eigenvalue = (trace - @sqrt(@max(0, trace * trace - 4 * det))) / 2.0;
+
+    // If insufficient texture, return zero flow with high uncertainty
+    if (min_eigenvalue < 0.01) {
+        return .{
+            .flow = Vec2.zero,
+            .covariance = Mat2.diagonal(Vec2.init(100.0, 100.0)),
+            .weight = 0.01,
+        };
+    }
+
+    // Compute temporal gradient (brightness difference)
+    var sum_ix_it: f32 = 0;
+    var sum_iy_it: f32 = 0;
+
+    const half_w = window_size / 2;
+    const width = prev_grid.width;
+    const height = prev_grid.height;
+
+    var wy: u32 = 0;
+    while (wy < window_size) : (wy += 1) {
+        const py = @as(i32, @intCast(y)) - @as(i32, @intCast(half_w)) + @as(i32, @intCast(wy));
+        if (py < 1 or py >= @as(i32, @intCast(height)) - 1) continue;
+
+        var wx: u32 = 0;
+        while (wx < window_size) : (wx += 1) {
+            const px = @as(i32, @intCast(x)) - @as(i32, @intCast(half_w)) + @as(i32, @intCast(wx));
+            if (px < 1 or px >= @as(i32, @intCast(width)) - 1) continue;
+
+            const ux = @as(u32, @intCast(px));
+            const uy = @as(u32, @intCast(py));
+
+            // Spatial gradients from previous frame
+            const left = prev_grid.get(ux - 1, uy);
+            const right = prev_grid.get(ux + 1, uy);
+            const up = prev_grid.get(ux, uy - 1);
+            const down = prev_grid.get(ux, uy + 1);
+
+            const b_left = (left.color.x + left.color.y + left.color.z) / 3.0;
+            const b_right = (right.color.x + right.color.y + right.color.z) / 3.0;
+            const b_up = (up.color.x + up.color.y + up.color.z) / 3.0;
+            const b_down = (down.color.x + down.color.y + down.color.z) / 3.0;
+
+            const ix = (b_right - b_left) / 2.0;
+            const iy = (b_down - b_up) / 2.0;
+
+            // Temporal gradient
+            const prev_px = prev_grid.get(ux, uy);
+            const curr_px = curr_grid.get(ux, uy);
+            const b_prev = (prev_px.color.x + prev_px.color.y + prev_px.color.z) / 3.0;
+            const b_curr = (curr_px.color.x + curr_px.color.y + curr_px.color.z) / 3.0;
+            const it = b_curr - b_prev;
+
+            sum_ix_it += ix * it;
+            sum_iy_it += iy * it;
+        }
+    }
+
+    // Solve M * flow = -b where b = [sum_ix_it, sum_iy_it]
+    const M_inv = M.inverse() orelse {
+        return .{
+            .flow = Vec2.zero,
+            .covariance = Mat2.diagonal(Vec2.init(100.0, 100.0)),
+            .weight = 0.01,
+        };
+    };
+
+    const b = Vec2.init(-sum_ix_it, -sum_iy_it);
+    const flow = M_inv.mulVec(b);
+
+    // Heteroscedastic covariance: Σ = σ² * M⁻¹
+    // where σ² is the noise floor (residual variance)
+    const covariance = M_inv.scale(noise_floor * noise_floor);
+
+    // Weight based on smallest eigenvalue (texture strength)
+    const weight = @min(1.0, min_eigenvalue / 1.0);
+
+    return .{ .flow = flow, .covariance = covariance, .weight = weight };
+}
+
+/// Compute sparse optical flow between consecutive detection sets
+/// Uses Lucas-Kanade at each detection centroid with heteroscedastic covariance
+pub fn computeSparseFlow(
+    prev_detections: []const Detection2D,
+    curr_detections: []const Detection2D,
+    prev_grid: ObservationGrid,
+    curr_grid: ObservationGrid,
+    config: SparseFlowConfig,
+    allocator: std.mem.Allocator,
+) ![]FlowObservation {
+    var observations: std.ArrayList(FlowObservation) = .empty;
+    errdefer observations.deinit(allocator);
+
+    // For each previous detection, find best match in current frame
+    // and compute optical flow
+    for (prev_detections, 0..) |prev_det, prev_idx| {
+        // Find nearest detection in current frame (simple greedy matching)
+        var best_curr_idx: ?usize = null;
+        var best_dist: f32 = config.max_match_distance;
+
+        for (curr_detections, 0..) |curr_det, curr_idx| {
+            const dx = curr_det.pixel_x - prev_det.pixel_x;
+            const dy = curr_det.pixel_y - prev_det.pixel_y;
+            const dist = @sqrt(dx * dx + dy * dy);
+
+            // Also check color similarity
+            const color_diff = curr_det.color.sub(prev_det.color);
+            const color_dist = @sqrt(color_diff.dot(color_diff));
+
+            if (dist < best_dist and color_dist < config.max_color_distance) {
+                best_dist = dist;
+                best_curr_idx = curr_idx;
+            }
+        }
+
+        if (best_curr_idx) |curr_idx| {
+            // Compute Lucas-Kanade flow at the detection centroid
+            const px = @as(u32, @intFromFloat(@max(0, prev_det.pixel_x)));
+            const py = @as(u32, @intFromFloat(@max(0, prev_det.pixel_y)));
+
+            // Clamp to valid range
+            const clamped_x = @min(px, prev_grid.width - 1);
+            const clamped_y = @min(py, prev_grid.height - 1);
+
+            const lk_result = lucasKanadeAtPoint(
+                prev_grid,
+                curr_grid,
+                clamped_x,
+                clamped_y,
+                config.window_size,
+                config.noise_floor,
+            );
+
+            // Only add if confidence is above threshold
+            if (lk_result.weight >= config.min_weight) {
+                try observations.append(allocator, FlowObservation{
+                    .prev_detection_idx = prev_idx,
+                    .curr_detection_idx = curr_idx,
+                    .flow = lk_result.flow,
+                    .covariance = lk_result.covariance,
+                    .weight = lk_result.weight,
+                });
+            }
+        }
+    }
+
+    return observations.toOwnedSlice(allocator);
+}
+
+/// Configuration for sparse optical flow computation
+pub const SparseFlowConfig = struct {
+    /// Lucas-Kanade window size (pixels)
+    window_size: u32 = 7,
+    /// Noise floor for covariance estimation
+    noise_floor: f32 = 0.1,
+    /// Maximum pixel distance for detection matching
+    max_match_distance: f32 = 50.0,
+    /// Maximum color distance for detection matching
+    max_color_distance: f32 = 0.5,
+    /// Minimum weight (texture confidence) to include observation
+    min_weight: f32 = 0.1,
+};
+
+/// Resolution-adaptive flow configuration
+/// Scales optical flow parameters based on image resolution to maintain
+/// consistent tracking behavior across different image sizes.
+///
+/// ## Resolution Scaling Rationale
+///
+/// At low resolutions (e.g., 32px), fixed parameters designed for higher
+/// resolutions cause problems:
+/// - 7px window = 22% of image (too large, captures multiple entities)
+/// - 50px match distance = 156% of image (matches anything)
+/// - Texture gradients are weak (few pixels per object)
+///
+/// At high resolutions, the same parameters may be too conservative.
+///
+/// ## Scaling Strategy
+///
+/// Window size: ~1.4% of min dimension (e.g., 9px at 640px, 5px at 360px)
+/// Match distance: ~6.9% of image diagonal
+/// Noise floor: Inversely proportional to resolution (more noise at low res)
+///
+/// Below 48px minimum dimension, flow is disabled entirely as reliable
+/// gradient computation becomes impossible.
+pub const AdaptedFlowConfig = struct {
+    /// Base configuration (scaled for resolution)
+    base: SparseFlowConfig,
+    /// Whether flow is enabled for this resolution
+    enabled: bool,
+
+    /// Default disabled configuration
+    pub const disabled: AdaptedFlowConfig = .{
+        .base = .{},
+        .enabled = false,
+    };
+
+    /// Create resolution-adapted flow configuration
+    ///
+    /// Parameters:
+    /// - width: Image width in pixels
+    /// - height: Image height in pixels
+    ///
+    /// Returns configuration with:
+    /// - enabled = false if min(width, height) < 48
+    /// - Scaled window_size, match_distance, noise_floor otherwise
+    pub fn forResolution(width: u32, height: u32) AdaptedFlowConfig {
+        const min_dim = @min(width, height);
+
+        // Disable flow below 48px (texture gradients unreliable)
+        if (min_dim < 48) {
+            return disabled;
+        }
+
+        const dim_f: f32 = @floatFromInt(min_dim);
+        const width_f: f32 = @floatFromInt(width);
+        const height_f: f32 = @floatFromInt(height);
+        const diag = @sqrt(width_f * width_f + height_f * height_f);
+
+        // Window size: ~1.4% of min dimension, odd, clamped to [3, 15]
+        // At 640px: 9px window
+        // At 64px: 3px window (minimum)
+        var window_raw = dim_f * 0.014;
+        window_raw = @max(3.0, @min(15.0, window_raw));
+        // Make odd
+        const window_int: u32 = @intFromFloat(window_raw);
+        const window_size = window_int | 1; // Ensure odd
+
+        // Match distance: ~6.9% of diagonal
+        // At 640x480 (diag ~800): 55px
+        // At 64x64 (diag ~90): 6px
+        const max_match_distance = diag * 0.069;
+
+        // Noise floor: inversely proportional to resolution
+        // Higher noise at lower resolution (fewer pixels, more uncertainty)
+        // At 512px: 0.1 (base)
+        // At 64px: 0.8 (8x higher noise)
+        const noise_floor = 0.1 * (512.0 / dim_f);
+
+        return .{
+            .base = .{
+                .window_size = window_size,
+                .max_match_distance = max_match_distance,
+                .noise_floor = noise_floor,
+                .max_color_distance = 0.5, // Keep fixed
+                .min_weight = 0.1, // Keep fixed
+            },
+            .enabled = true,
+        };
+    }
+
+    /// Get the base config (for use with computeSparseFlow)
+    pub fn getConfig(self: AdaptedFlowConfig) SparseFlowConfig {
+        return self.base;
+    }
+};
 
 /// Compute back-projection observation log-likelihood
 /// This is the conjugate alternative to pixel-wise rendering comparison
@@ -843,10 +1280,11 @@ pub fn entityLogLikelihood(
     const proj = camera.project(pos) orelse return -std.math.inf(f32);
 
     // Convert NDC to pixel coordinates
+    // NDC: Y increases upward, Image: Y increases downward
     const half_w: f32 = @floatFromInt(observed.width / 2);
     const half_h: f32 = @floatFromInt(observed.height / 2);
     const px = @as(u32, @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(observed.width - 1)), (proj.ndc.x + 1) * half_w))));
-    const py = @as(u32, @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(observed.height - 1)), (proj.ndc.y + 1) * half_h))));
+    const py = @as(u32, @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(observed.height - 1)), (1 - proj.ndc.y) * half_h)))); // Flip Y
 
     // Compute perspective-correct projected radius in pixel space
     // projectRadius returns vertical NDC units, so multiply by half_h
@@ -1063,4 +1501,125 @@ test "outerProduct symmetry" {
     for (0..9) |i| {
         try testing.expect(@abs(vw_t.data[i] - wv.data[i]) < 1e-6);
     }
+}
+
+test "FlowObservation log-likelihood" {
+    // Flow observation with known covariance
+    const flow_obs = FlowObservation{
+        .prev_detection_idx = 0,
+        .curr_detection_idx = 0,
+        .flow = Vec2.init(2.0, 1.0),
+        .covariance = Mat2.diagonal(Vec2.init(1.0, 1.0)),
+        .weight = 1.0,
+    };
+
+    // Perfect match should have highest likelihood
+    const perfect_ll = flow_obs.logLikelihood(Vec2.init(2.0, 1.0));
+    const offset_ll = flow_obs.logLikelihood(Vec2.init(4.0, 1.0));
+
+    // Perfect match should be higher
+    try testing.expect(perfect_ll > offset_ll);
+
+    // Log-likelihood should be negative (unnormalized Gaussian)
+    try testing.expect(perfect_ll <= 0);
+}
+
+test "Structure tensor computation" {
+    const allocator = testing.allocator;
+
+    // Create a grid with a gradient (textured region)
+    var grid = try ObservationGrid.init(16, 16, allocator);
+    defer grid.deinit();
+
+    // Create horizontal gradient
+    for (0..16) |yi| {
+        for (0..16) |xi| {
+            const brightness = @as(f32, @floatFromInt(xi)) / 16.0;
+            grid.set(@intCast(xi), @intCast(yi), .{
+                .color = Vec3.init(brightness, brightness, brightness),
+                .depth = 1.0,
+                .occupied = true,
+            });
+        }
+    }
+
+    // Structure tensor at center should have strong horizontal gradient
+    const M = structureTensor(grid, 8, 8, 5);
+
+    // Ix² should be non-zero (horizontal gradient exists)
+    try testing.expect(M.get(0, 0) > 0.001);
+
+    // Iy² should be small (no vertical gradient)
+    try testing.expect(M.get(1, 1) < M.get(0, 0));
+}
+
+test "Sparse flow config defaults" {
+    const config = SparseFlowConfig{};
+
+    try testing.expect(config.window_size == 7);
+    try testing.expect(config.noise_floor > 0);
+    try testing.expect(config.max_match_distance > 0);
+}
+
+test "AdaptedFlowConfig disabled at low resolution" {
+    // Below 48px minimum dimension, flow should be disabled
+    const config_32 = AdaptedFlowConfig.forResolution(32, 32);
+    try testing.expect(!config_32.enabled);
+
+    const config_40 = AdaptedFlowConfig.forResolution(40, 40);
+    try testing.expect(!config_40.enabled);
+
+    const config_47 = AdaptedFlowConfig.forResolution(47, 100);
+    try testing.expect(!config_47.enabled);
+}
+
+test "AdaptedFlowConfig enabled at sufficient resolution" {
+    // At 48px and above, flow should be enabled
+    const config_48 = AdaptedFlowConfig.forResolution(48, 48);
+    try testing.expect(config_48.enabled);
+
+    const config_64 = AdaptedFlowConfig.forResolution(64, 64);
+    try testing.expect(config_64.enabled);
+
+    const config_640 = AdaptedFlowConfig.forResolution(640, 480);
+    try testing.expect(config_640.enabled);
+}
+
+test "AdaptedFlowConfig scales window size" {
+    // At 64px, window should be small (3-5px)
+    const config_64 = AdaptedFlowConfig.forResolution(64, 64);
+    try testing.expect(config_64.base.window_size >= 3);
+    try testing.expect(config_64.base.window_size <= 5);
+    // Window should be odd
+    try testing.expect(config_64.base.window_size % 2 == 1);
+
+    // At 640px, window should be larger
+    const config_640 = AdaptedFlowConfig.forResolution(640, 480);
+    try testing.expect(config_640.base.window_size > config_64.base.window_size);
+    try testing.expect(config_640.base.window_size % 2 == 1);
+}
+
+test "AdaptedFlowConfig scales match distance" {
+    // At low resolution, match distance should be small
+    const config_64 = AdaptedFlowConfig.forResolution(64, 64);
+    // Diagonal of 64x64 is ~90, so match distance should be ~6px
+    try testing.expect(config_64.base.max_match_distance < 15.0);
+    try testing.expect(config_64.base.max_match_distance > 3.0);
+
+    // At high resolution, match distance should be larger
+    const config_640 = AdaptedFlowConfig.forResolution(640, 480);
+    // Diagonal of 640x480 is ~800, so match distance should be ~55px
+    try testing.expect(config_640.base.max_match_distance > 40.0);
+    try testing.expect(config_640.base.max_match_distance < 70.0);
+}
+
+test "AdaptedFlowConfig increases noise at low resolution" {
+    const config_64 = AdaptedFlowConfig.forResolution(64, 64);
+    const config_512 = AdaptedFlowConfig.forResolution(512, 512);
+
+    // Lower resolution should have higher noise floor
+    try testing.expect(config_64.base.noise_floor > config_512.base.noise_floor);
+
+    // At 512px, noise should be close to base (0.1)
+    try testing.expectApproxEqAbs(@as(f32, 0.1), config_512.base.noise_floor, 0.05);
 }

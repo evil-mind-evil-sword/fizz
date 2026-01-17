@@ -95,11 +95,13 @@ pub const Physics = struct {
 
 /// Contact mode - discrete state for SLDS
 /// Core knowledge: Solidity (objects don't pass through each other)
+/// Spelke core knowledge: Support emerges from contact with static geometry or entities
 pub const ContactMode = enum(u8) {
     /// Free flight under gravity
     free,
-    /// Resting on ground plane
-    ground,
+    /// Contact with static geometry (ground plane, walls)
+    /// Renamed from 'ground' for domain-generality
+    environment,
     /// Resting on another entity (support relationship)
     supported,
     /// Attached to surface (sticky behavior)

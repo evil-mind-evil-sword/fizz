@@ -22,12 +22,15 @@ const types = @import("../types.zig");
 const Vec3 = math.Vec3;
 const Mat3 = math.Mat3;
 const Label = types.Label;
-const PhysicsType = types.PhysicsType;
+const PhysicsParams = types.PhysicsParams;
+const PhysicsParamsUncertainty = types.PhysicsParamsUncertainty;
 const ContactMode = types.ContactMode;
 const TrackState = types.TrackState;
 const GoalType = types.GoalType;
 const SpatialRelationType = types.SpatialRelationType;
 const CameraPose = types.CameraPose;
+const Gaussian6D = types.Gaussian6D;
+const CovTriangle21 = types.CovTriangle21;
 const Allocator = std.mem.Allocator;
 
 /// Default maximum entities per particle
@@ -67,7 +70,8 @@ pub const EntityView = struct {
     position_cov: CovTriangle,
     velocity_mean: Vec3,
     velocity_cov: CovTriangle,
-    physics_type: PhysicsType,
+    physics_params: PhysicsParams,
+    physics_params_uncertainty: PhysicsParamsUncertainty,
     contact_mode: ContactMode,
     track_state: TrackState,
     label: Label,
@@ -112,8 +116,20 @@ pub const ParticleSwarm = struct {
     velocity_mean: []Vec3,
     /// Velocity covariances (upper triangle)
     velocity_cov: []CovTriangle,
-    /// Physics type (discrete, Gibbs-sampled)
-    physics_type: []PhysicsType,
+
+    // =========================================================================
+    // Coupled 6D State (for cross-covariance tracking)
+    // =========================================================================
+
+    /// 6D state means [px, py, pz, vx, vy, vz] (coupled position+velocity)
+    state_mean: [][6]f32,
+    /// 6D state covariances (21-element upper triangle of 6x6)
+    state_cov: []CovTriangle21,
+
+    /// Continuous physics parameters (Spelke-aligned inference)
+    physics_params: []PhysicsParams,
+    /// Uncertainty in physics parameters (Beta distribution params for conjugate updates)
+    physics_params_uncertainty: []PhysicsParamsUncertainty,
     /// Contact mode (discrete)
     contact_mode: []ContactMode,
     /// Track state (detected/occluded/tentative/dead)
@@ -189,7 +205,10 @@ pub const ParticleSwarm = struct {
     swap_position_cov: ?[]CovTriangle,
     swap_velocity_mean: ?[]Vec3,
     swap_velocity_cov: ?[]CovTriangle,
-    swap_physics_type: ?[]PhysicsType,
+    swap_state_mean: ?[][6]f32,
+    swap_state_cov: ?[]CovTriangle21,
+    swap_physics_params: ?[]PhysicsParams,
+    swap_physics_params_uncertainty: ?[]PhysicsParamsUncertainty,
     swap_contact_mode: ?[]ContactMode,
     swap_track_state: ?[]TrackState,
     swap_label: ?[]Label,
@@ -228,8 +247,17 @@ pub const ParticleSwarm = struct {
         errdefer allocator.free(velocity_mean);
         const velocity_cov = try allocator.alloc(CovTriangle, entity_slots);
         errdefer allocator.free(velocity_cov);
-        const physics_type = try allocator.alloc(PhysicsType, entity_slots);
-        errdefer allocator.free(physics_type);
+
+        // 6D coupled state arrays
+        const state_mean = try allocator.alloc([6]f32, entity_slots);
+        errdefer allocator.free(state_mean);
+        const state_cov = try allocator.alloc(CovTriangle21, entity_slots);
+        errdefer allocator.free(state_cov);
+
+        const physics_params_arr = try allocator.alloc(PhysicsParams, entity_slots);
+        errdefer allocator.free(physics_params_arr);
+        const physics_params_uncertainty_arr = try allocator.alloc(PhysicsParamsUncertainty, entity_slots);
+        errdefer allocator.free(physics_params_uncertainty_arr);
         const contact_mode = try allocator.alloc(ContactMode, entity_slots);
         errdefer allocator.free(contact_mode);
         const track_state_arr = try allocator.alloc(TrackState, entity_slots);
@@ -282,6 +310,12 @@ pub const ParticleSwarm = struct {
 
         // Initialize to zero/default
         @memset(alive_arr, false);
+        // Initialize 6D state arrays
+        @memset(state_mean, .{ 0, 0, 0, 0, 0, 0 });
+        @memset(state_cov, CovTriangle21.identity);
+        // Initialize physics params with weak prior
+        @memset(physics_params_arr, PhysicsParams.prior);
+        @memset(physics_params_uncertainty_arr, PhysicsParamsUncertainty.weak_prior);
         @memset(goal_type_arr, .none);
         @memset(target_label_arr, null);
         @memset(target_position_arr, null);
@@ -304,7 +338,10 @@ pub const ParticleSwarm = struct {
             .position_cov = position_cov,
             .velocity_mean = velocity_mean,
             .velocity_cov = velocity_cov,
-            .physics_type = physics_type,
+            .state_mean = state_mean,
+            .state_cov = state_cov,
+            .physics_params = physics_params_arr,
+            .physics_params_uncertainty = physics_params_uncertainty_arr,
             .contact_mode = contact_mode,
             .track_state = track_state_arr,
             .label = label_arr,
@@ -334,7 +371,10 @@ pub const ParticleSwarm = struct {
             .swap_position_cov = null,
             .swap_velocity_mean = null,
             .swap_velocity_cov = null,
-            .swap_physics_type = null,
+            .swap_state_mean = null,
+            .swap_state_cov = null,
+            .swap_physics_params = null,
+            .swap_physics_params_uncertainty = null,
             .swap_contact_mode = null,
             .swap_track_state = null,
             .swap_label = null,
@@ -363,7 +403,10 @@ pub const ParticleSwarm = struct {
         self.allocator.free(self.position_cov);
         self.allocator.free(self.velocity_mean);
         self.allocator.free(self.velocity_cov);
-        self.allocator.free(self.physics_type);
+        self.allocator.free(self.state_mean);
+        self.allocator.free(self.state_cov);
+        self.allocator.free(self.physics_params);
+        self.allocator.free(self.physics_params_uncertainty);
         self.allocator.free(self.contact_mode);
         self.allocator.free(self.track_state);
         self.allocator.free(self.label);
@@ -393,7 +436,10 @@ pub const ParticleSwarm = struct {
         if (self.swap_position_cov) |buf| self.allocator.free(buf);
         if (self.swap_velocity_mean) |buf| self.allocator.free(buf);
         if (self.swap_velocity_cov) |buf| self.allocator.free(buf);
-        if (self.swap_physics_type) |buf| self.allocator.free(buf);
+        if (self.swap_state_mean) |buf| self.allocator.free(buf);
+        if (self.swap_state_cov) |buf| self.allocator.free(buf);
+        if (self.swap_physics_params) |buf| self.allocator.free(buf);
+        if (self.swap_physics_params_uncertainty) |buf| self.allocator.free(buf);
         if (self.swap_contact_mode) |buf| self.allocator.free(buf);
         if (self.swap_track_state) |buf| self.allocator.free(buf);
         if (self.swap_label) |buf| self.allocator.free(buf);
@@ -443,7 +489,8 @@ pub const ParticleSwarm = struct {
             .position_cov = self.position_cov[i],
             .velocity_mean = self.velocity_mean[i],
             .velocity_cov = self.velocity_cov[i],
-            .physics_type = self.physics_type[i],
+            .physics_params = self.physics_params[i],
+            .physics_params_uncertainty = self.physics_params_uncertainty[i],
             .contact_mode = self.contact_mode[i],
             .track_state = self.track_state[i],
             .label = self.label[i],
@@ -469,7 +516,8 @@ pub const ParticleSwarm = struct {
         self.position_cov[i] = view.position_cov;
         self.velocity_mean[i] = view.velocity_mean;
         self.velocity_cov[i] = view.velocity_cov;
-        self.physics_type[i] = view.physics_type;
+        self.physics_params[i] = view.physics_params;
+        self.physics_params_uncertainty[i] = view.physics_params_uncertainty;
         self.contact_mode[i] = view.contact_mode;
         self.track_state[i] = view.track_state;
         self.label[i] = view.label;
@@ -485,6 +533,28 @@ pub const ParticleSwarm = struct {
         self.spatial_reference[i] = view.spatial_reference;
         self.spatial_distance[i] = view.spatial_distance;
         self.spatial_tolerance[i] = view.spatial_tolerance;
+
+        // Initialize 6D state from factored arrays (zero cross-covariance initially)
+        const pos = view.position_mean;
+        const vel = view.velocity_mean;
+        self.state_mean[i] = .{ pos.x, pos.y, pos.z, vel.x, vel.y, vel.z };
+
+        // Build 6D covariance from factored covariances with zero cross-covariance
+        const P_pp = Mat3{
+            .data = .{
+                view.position_cov[0], view.position_cov[1], view.position_cov[2],
+                view.position_cov[1], view.position_cov[3], view.position_cov[4],
+                view.position_cov[2], view.position_cov[4], view.position_cov[5],
+            },
+        };
+        const P_vv = Mat3{
+            .data = .{
+                view.velocity_cov[0], view.velocity_cov[1], view.velocity_cov[2],
+                view.velocity_cov[1], view.velocity_cov[3], view.velocity_cov[4],
+                view.velocity_cov[2], view.velocity_cov[4], view.velocity_cov[5],
+            },
+        };
+        self.state_cov[i] = CovTriangle21.fromBlocks(P_pp, P_vv, Mat3.zero);
     }
 
     /// Check if entity slot is alive
@@ -517,6 +587,73 @@ pub const ParticleSwarm = struct {
             }
         }
         return null; // No free slots
+    }
+
+    // =========================================================================
+    // 6D Coupled State Access
+    // =========================================================================
+
+    /// Get 6D coupled state (position + velocity with cross-covariance)
+    pub fn getState6D(self: *const Self, entity_idx: usize) Gaussian6D {
+        return Gaussian6D{
+            .mean = self.state_mean[entity_idx],
+            .cov = self.state_cov[entity_idx],
+        };
+    }
+
+    /// Set 6D coupled state (position + velocity with cross-covariance)
+    pub fn setState6D(self: *Self, entity_idx: usize, state: Gaussian6D) void {
+        self.state_mean[entity_idx] = state.mean;
+        self.state_cov[entity_idx] = state.cov;
+
+        // Keep factored arrays in sync for backward compatibility
+        self.position_mean[entity_idx] = state.position();
+        self.velocity_mean[entity_idx] = state.velocity();
+
+        // Extract position and velocity covariances (loses cross-covariance!)
+        const pos_tri = state.cov.positionBlock();
+        const vel_tri = state.cov.velocityBlock();
+        self.position_cov[entity_idx] = pos_tri;
+        self.velocity_cov[entity_idx] = vel_tri;
+    }
+
+    /// Get 6D state for (particle, entity) pair
+    pub fn getState6DAt(self: *const Self, particle: usize, entity: usize) Gaussian6D {
+        return self.getState6D(self.idx(particle, entity));
+    }
+
+    /// Set 6D state for (particle, entity) pair
+    pub fn setState6DAt(self: *Self, particle: usize, entity: usize, state: Gaussian6D) void {
+        self.setState6D(self.idx(particle, entity), state);
+    }
+
+    /// Initialize 6D state from position and velocity means (for new entities)
+    /// Creates diagonal covariance with default variances (no cross-covariance)
+    pub fn initState6D(self: *Self, entity_idx: usize, pos: Vec3, vel: Vec3) void {
+        // Default variances for new entities
+        const pos_var: f32 = 0.1;
+        const vel_var: f32 = 0.01;
+
+        self.state_mean[entity_idx] = .{ pos.x, pos.y, pos.z, vel.x, vel.y, vel.z };
+        self.state_cov[entity_idx] = CovTriangle21.diagonal(
+            Vec3.splat(pos_var),
+            Vec3.splat(vel_var),
+        );
+
+        // Keep factored arrays in sync
+        self.position_mean[entity_idx] = pos;
+        self.velocity_mean[entity_idx] = vel;
+        self.position_cov[entity_idx] = .{ pos_var, 0, 0, pos_var, 0, pos_var };
+        self.velocity_cov[entity_idx] = .{ vel_var, 0, 0, vel_var, 0, vel_var };
+    }
+
+    /// Sync 6D state mean from factored position/velocity arrays
+    /// Call this after directly modifying position_mean/velocity_mean (e.g. after bounce handling)
+    /// Preserves the 6D covariance including cross-covariance
+    pub fn syncFactoredTo6DMean(self: *Self, entity_idx: usize) void {
+        const pos = self.position_mean[entity_idx];
+        const vel = self.velocity_mean[entity_idx];
+        self.state_mean[entity_idx] = .{ pos.x, pos.y, pos.z, vel.x, vel.y, vel.z };
     }
 
     // =========================================================================
@@ -614,8 +751,17 @@ pub const ParticleSwarm = struct {
         if (self.swap_velocity_cov == null) {
             self.swap_velocity_cov = try self.allocator.alloc(CovTriangle, entity_slots);
         }
-        if (self.swap_physics_type == null) {
-            self.swap_physics_type = try self.allocator.alloc(PhysicsType, entity_slots);
+        if (self.swap_state_mean == null) {
+            self.swap_state_mean = try self.allocator.alloc([6]f32, entity_slots);
+        }
+        if (self.swap_state_cov == null) {
+            self.swap_state_cov = try self.allocator.alloc(CovTriangle21, entity_slots);
+        }
+        if (self.swap_physics_params == null) {
+            self.swap_physics_params = try self.allocator.alloc(PhysicsParams, entity_slots);
+        }
+        if (self.swap_physics_params_uncertainty == null) {
+            self.swap_physics_params_uncertainty = try self.allocator.alloc(PhysicsParamsUncertainty, entity_slots);
         }
         if (self.swap_contact_mode == null) {
             self.swap_contact_mode = try self.allocator.alloc(ContactMode, entity_slots);
@@ -680,7 +826,10 @@ pub const ParticleSwarm = struct {
         position_cov: []CovTriangle,
         velocity_mean: []Vec3,
         velocity_cov: []CovTriangle,
-        physics_type: []PhysicsType,
+        state_mean: [][6]f32,
+        state_cov: []CovTriangle21,
+        physics_params: []PhysicsParams,
+        physics_params_uncertainty: []PhysicsParamsUncertainty,
         contact_mode: []ContactMode,
         track_state: []TrackState,
         label: []Label,
@@ -707,7 +856,10 @@ pub const ParticleSwarm = struct {
             .position_cov = self.swap_position_cov orelse return null,
             .velocity_mean = self.swap_velocity_mean orelse return null,
             .velocity_cov = self.swap_velocity_cov orelse return null,
-            .physics_type = self.swap_physics_type orelse return null,
+            .state_mean = self.swap_state_mean orelse return null,
+            .state_cov = self.swap_state_cov orelse return null,
+            .physics_params = self.swap_physics_params orelse return null,
+            .physics_params_uncertainty = self.swap_physics_params_uncertainty orelse return null,
             .contact_mode = self.swap_contact_mode orelse return null,
             .track_state = self.swap_track_state orelse return null,
             .label = self.swap_label orelse return null,
@@ -772,8 +924,9 @@ test "ParticleSwarm entity get/set round trip" {
         .position_cov = .{ 0.1, 0, 0, 0.1, 0, 0.1 },
         .velocity_mean = Vec3.init(0.5, -0.5, 0),
         .velocity_cov = .{ 0.01, 0, 0, 0.01, 0, 0.01 },
-        .physics_type = .bouncy,
-        .contact_mode = .ground,
+        .physics_params = PhysicsParams.prior,
+        .physics_params_uncertainty = PhysicsParamsUncertainty.weak_prior,
+        .contact_mode = .environment,
         .track_state = .detected,
         .label = .{ .birth_time = 42, .birth_index = 7 },
         .occlusion_count = 3,
@@ -796,7 +949,7 @@ test "ParticleSwarm entity get/set round trip" {
     try std.testing.expectEqual(test_entity.position_mean.x, retrieved.position_mean.x);
     try std.testing.expectEqual(test_entity.position_mean.y, retrieved.position_mean.y);
     try std.testing.expectEqual(test_entity.position_mean.z, retrieved.position_mean.z);
-    try std.testing.expectEqual(test_entity.physics_type, retrieved.physics_type);
+    try std.testing.expectEqual(test_entity.physics_params.elasticity, retrieved.physics_params.elasticity);
     try std.testing.expectEqual(test_entity.label.birth_time, retrieved.label.birth_time);
     try std.testing.expectEqual(test_entity.label.birth_index, retrieved.label.birth_index);
     try std.testing.expectEqual(test_entity.alive, retrieved.alive);
@@ -815,7 +968,8 @@ test "ParticleSwarm addEntity and killEntity" {
         .position_cov = .{ 1, 0, 0, 1, 0, 1 },
         .velocity_mean = Vec3.zero,
         .velocity_cov = .{ 1, 0, 0, 1, 0, 1 },
-        .physics_type = .standard,
+        .physics_params = PhysicsParams.prior,
+        .physics_params_uncertainty = PhysicsParamsUncertainty.weak_prior,
         .contact_mode = .free,
         .track_state = .detected,
         .label = .{ .birth_time = 0, .birth_index = 0 },
@@ -919,3 +1073,41 @@ test "covToTriangle and triangleToCov round trip" {
     try std.testing.expectApproxEqAbs(recovered.get(0, 2), recovered.get(2, 0), 0.001);
     try std.testing.expectApproxEqAbs(recovered.get(1, 2), recovered.get(2, 1), 0.001);
 }
+
+test "ParticleSwarm 6D state accessors" {
+    const allocator = std.testing.allocator;
+
+    var swarm = try ParticleSwarm.init(allocator, 2, 4);
+    defer swarm.deinit();
+
+    // Create a 6D state with cross-covariance
+    var state = Gaussian6D.isotropic(
+        Vec3.init(1, 2, 3), // position
+        0.5, // pos variance
+        Vec3.init(0.1, 0.2, 0.3), // velocity
+        0.01, // vel variance
+    );
+
+    // Add some cross-covariance to test
+    state.cov.set(0, 3, 0.05); // px-vx correlation
+
+    // Set the state
+    swarm.setState6D(swarm.idx(0, 0), state);
+
+    // Get the state back
+    const retrieved = swarm.getState6D(swarm.idx(0, 0));
+
+    // Verify mean
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), retrieved.position().x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), retrieved.position().y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), retrieved.position().z, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), retrieved.velocity().x, 1e-6);
+
+    // Verify cross-covariance is preserved
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), retrieved.cov.get(0, 3), 1e-6);
+
+    // Verify factored arrays are synced
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), swarm.position_mean[0].x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), swarm.velocity_mean[0].x, 1e-6);
+}
+

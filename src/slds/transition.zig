@@ -31,7 +31,7 @@ pub const ModeTransitionPrior = struct {
 
         return switch (from) {
             .free => transitionFromFree(to, contact_detected, high_speed),
-            .ground => transitionFromGround(to, contact_detected, low_speed, high_speed),
+            .environment => transitionFromEnvironment(to, contact_detected, low_speed, high_speed),
             .supported => transitionFromSupported(to, low_speed),
             .attached => transitionFromAttached(to),
             .agency => transitionFromAgency(to, low_speed),
@@ -43,7 +43,7 @@ pub const ModeTransitionPrior = struct {
         if (contact_detected) {
             return switch (to) {
                 .free => 0.1, // Bounce off
-                .ground => 0.7, // Land on ground
+                .environment => 0.7, // Land on environment (ground, wall)
                 .supported => 0.15, // Land on object
                 .attached => 0.04, // Stick (rare)
                 .agency => 0.01, // Spontaneous agency (very rare)
@@ -51,7 +51,7 @@ pub const ModeTransitionPrior = struct {
         } else {
             return switch (to) {
                 .free => 0.95, // Continue flying
-                .ground => 0.02, // Unlikely without contact
+                .environment => 0.02, // Unlikely without contact
                 .supported => 0.01,
                 .attached => 0.01,
                 .agency => 0.01, // Objects don't spontaneously become agents
@@ -60,9 +60,10 @@ pub const ModeTransitionPrior = struct {
         _ = high_speed;
     }
 
-    /// Transitions from ground contact
+    /// Transitions from environment contact (ground, walls)
     /// Core knowledge: Objects at rest stay at rest
-    fn transitionFromGround(
+    /// Renamed from transitionFromGround for domain-generality
+    fn transitionFromEnvironment(
         to: ContactMode,
         contact_detected: bool,
         low_speed: bool,
@@ -73,8 +74,8 @@ pub const ModeTransitionPrior = struct {
         if (low_speed) {
             // Very stable when at rest - "island of stability"
             return switch (to) {
-                .free => 0.01, // Almost never leaves ground spontaneously
-                .ground => 0.97, // Very likely to stay
+                .free => 0.01, // Almost never leaves environment spontaneously
+                .environment => 0.97, // Very likely to stay
                 .supported => 0.01, // Would need something on top
                 .attached => 0.005, // Could become sticky
                 .agency => 0.005, // Could become agent
@@ -83,7 +84,7 @@ pub const ModeTransitionPrior = struct {
             // More likely to leave if moving fast
             return switch (to) {
                 .free => 0.3, // Can launch
-                .ground => 0.65, // Still likely to stay
+                .environment => 0.65, // Still likely to stay
                 .supported => 0.02,
                 .attached => 0.02,
                 .agency => 0.01,
@@ -92,7 +93,7 @@ pub const ModeTransitionPrior = struct {
             // Medium speed
             return switch (to) {
                 .free => 0.1,
-                .ground => 0.85,
+                .environment => 0.85,
                 .supported => 0.02,
                 .attached => 0.02,
                 .agency => 0.01,
@@ -105,7 +106,7 @@ pub const ModeTransitionPrior = struct {
         if (low_speed) {
             return switch (to) {
                 .free => 0.02, // Supporter might move
-                .ground => 0.03, // Might fall to ground
+                .environment => 0.03, // Might fall to environment
                 .supported => 0.93, // Very stable stack
                 .attached => 0.01,
                 .agency => 0.01,
@@ -113,7 +114,7 @@ pub const ModeTransitionPrior = struct {
         } else {
             return switch (to) {
                 .free => 0.2,
-                .ground => 0.1,
+                .environment => 0.1,
                 .supported => 0.65,
                 .attached => 0.03,
                 .agency => 0.02,
@@ -126,7 +127,7 @@ pub const ModeTransitionPrior = struct {
         // Very stable - hard to unstick
         return switch (to) {
             .free => 0.02,
-            .ground => 0.02,
+            .environment => 0.02,
             .supported => 0.01,
             .attached => 0.94, // Stay attached
             .agency => 0.01,
@@ -139,7 +140,7 @@ pub const ModeTransitionPrior = struct {
             // Agent might stop
             return switch (to) {
                 .free => 0.1,
-                .ground => 0.2, // Might rest
+                .environment => 0.2, // Might rest on environment
                 .supported => 0.05,
                 .attached => 0.05,
                 .agency => 0.6, // Often continues as agent
@@ -147,7 +148,7 @@ pub const ModeTransitionPrior = struct {
         } else {
             return switch (to) {
                 .free => 0.15,
-                .ground => 0.1,
+                .environment => 0.1,
                 .supported => 0.05,
                 .attached => 0.05,
                 .agency => 0.65, // Agents tend to stay agents
@@ -165,7 +166,7 @@ pub const ModeTransitionPrior = struct {
         const u = rng.float(f32);
         var cumulative: f32 = 0;
 
-        const modes = [_]ContactMode{ .free, .ground, .supported, .attached, .agency };
+        const modes = [_]ContactMode{ .free, .environment, .supported, .attached, .agency };
         for (modes) |to_mode| {
             cumulative += transitionProb(from, to_mode, contact_detected, speed);
             if (u < cumulative) {
@@ -221,7 +222,7 @@ pub const PermanencePrior = struct {
 // =============================================================================
 
 test "ModeTransitionPrior sums to 1" {
-    const modes = [_]ContactMode{ .free, .ground, .supported, .attached, .agency };
+    const modes = [_]ContactMode{ .free, .environment, .supported, .attached, .agency };
 
     for (modes) |from| {
         var sum: f32 = 0;
@@ -233,11 +234,11 @@ test "ModeTransitionPrior sums to 1" {
     }
 }
 
-test "Stability prior - low speed ground stays ground" {
-    const p_stay = ModeTransitionPrior.transitionProb(.ground, .ground, false, 0.01);
-    const p_leave = ModeTransitionPrior.transitionProb(.ground, .free, false, 0.01);
+test "Stability prior - low speed environment stays environment" {
+    const p_stay = ModeTransitionPrior.transitionProb(.environment, .environment, false, 0.01);
+    const p_leave = ModeTransitionPrior.transitionProb(.environment, .free, false, 0.01);
 
-    // Should strongly prefer staying on ground when at rest
+    // Should strongly prefer staying on environment when at rest
     try std.testing.expect(p_stay > 0.9);
     try std.testing.expect(p_leave < 0.05);
 }

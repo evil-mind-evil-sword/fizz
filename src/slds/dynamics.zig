@@ -1,5 +1,6 @@
 const std = @import("std");
 const math = @import("../math.zig");
+const types = @import("../types.zig");
 const Vec3 = math.Vec3;
 const Mat3 = math.Mat3;
 
@@ -7,18 +8,22 @@ const ecs = @import("../ecs/mod.zig");
 const ContactMode = ecs.ContactMode;
 const Physics = ecs.Physics;
 
+// Re-export environment types for SLDS use
+pub const EnvironmentEntity = types.EnvironmentEntity;
+pub const EnvironmentConfig = types.EnvironmentConfig;
+
 // =============================================================================
 // Physics Configuration
 // =============================================================================
 
-/// Global physics parameters
+/// Global physics parameters for SLDS
 pub const PhysicsConfig = struct {
     /// Gravity vector
     gravity: Vec3 = Vec3.init(0, -9.81, 0),
     /// Simulation timestep
     dt: f32 = 1.0 / 60.0,
-    /// Ground plane height
-    ground_height: f32 = 0.0,
+    /// Environment configuration (ground plane, walls)
+    environment: EnvironmentConfig = .{},
     /// World bounds
     bounds_min: Vec3 = Vec3.init(-10, -10, -10),
     bounds_max: Vec3 = Vec3.init(10, 10, 10),
@@ -34,6 +39,14 @@ pub const PhysicsConfig = struct {
     stability_snap_prob: f32 = 0.1,
     /// Speed threshold for stability
     stability_speed_threshold: f32 = 0.1,
+
+    /// Get ground height from environment config
+    pub fn groundHeight(self: PhysicsConfig) f32 {
+        if (self.environment.ground) |g| {
+            return g.height;
+        }
+        return -std.math.inf(f32);
+    }
 };
 
 // =============================================================================
@@ -157,7 +170,7 @@ pub const SLDSMatrices = struct {
     ) SLDSMatrices {
         return switch (mode) {
             .free => freeDynamics(physics, config),
-            .ground => groundDynamics(physics, config),
+            .environment => environmentDynamics(physics, config),
             .supported => supportedDynamics(physics, config),
             .attached => attachedDynamics(physics, config),
             .agency => agencyDynamics(physics, config),
@@ -182,9 +195,10 @@ fn freeDynamics(physics: Physics, config: PhysicsConfig) SLDSMatrices {
     };
 }
 
-/// Ground contact dynamics - constrained to ground plane
+/// Environment contact dynamics - constrained to static geometry (ground plane, walls)
 /// Key Spelke principle: "Islands of stability" - low noise when supported
-fn groundDynamics(physics: Physics, config: PhysicsConfig) SLDSMatrices {
+/// Renamed from groundDynamics for domain-generality
+fn environmentDynamics(physics: Physics, config: PhysicsConfig) SLDSMatrices {
     const dt = config.dt;
     const damping = 1.0 - physics.friction * dt * 5.0; // Higher friction on ground
 
@@ -269,11 +283,11 @@ test "SLDS matrices per mode" {
     const physics = Physics.standard;
 
     const free_m = SLDSMatrices.forMode(.free, physics, config);
-    const ground_m = SLDSMatrices.forMode(.ground, physics, config);
+    const env_m = SLDSMatrices.forMode(.environment, physics, config);
 
     // Free mode should have gravity in b
     try std.testing.expect(free_m.b[4] < 0); // Negative y gravity
 
-    // Ground mode should have lower noise
-    try std.testing.expect(ground_m.Q.get(0, 0) < free_m.Q.get(0, 0));
+    // Environment mode should have lower noise (stability)
+    try std.testing.expect(env_m.Q.get(0, 0) < free_m.Q.get(0, 0));
 }

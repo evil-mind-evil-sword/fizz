@@ -6,7 +6,7 @@ const Vec3 = math.Vec3;
 
 const types = @import("../types.zig");
 const Camera = types.Camera;
-const PhysicsType = types.PhysicsType;
+const PhysicsParams = types.PhysicsParams;
 const Label = types.Label;
 const EntityId = types.EntityId;
 
@@ -35,8 +35,8 @@ pub const BirthProposal = struct {
     position: Vec3,
     /// Proposed velocity for new entity
     velocity: Vec3,
-    /// Physics type for new entity
-    physics_type: PhysicsType,
+    /// Physics parameters for new entity
+    physics_params: PhysicsParams,
     /// Log acceptance probability
     log_accept_prob: f32,
     /// Cluster size that generated this proposal
@@ -353,7 +353,7 @@ pub fn proposeBirth(
     return BirthProposal{
         .position = cluster.centroid,
         .velocity = velocity,
-        .physics_type = .standard,
+        .physics_params = PhysicsParams.standard,
         .log_accept_prob = log_accept_prob,
         .cluster_size = cluster.size,
         .color = cluster.avg_color,
@@ -371,7 +371,7 @@ pub fn executeBirth(
     const entity_id = world.spawnPhysics(
         proposal.position,
         proposal.velocity,
-        proposal.physics_type,
+        proposal.physics_params,
     ) orelse return null;
 
     // Register in label set
@@ -436,7 +436,7 @@ test "BirthProposal structure" {
     const proposal = BirthProposal{
         .position = Vec3.init(1, 2, 3),
         .velocity = Vec3.zero,
-        .physics_type = .standard,
+        .physics_params = PhysicsParams.standard,
         .log_accept_prob = -1.0,
         .cluster_size = 100,
         .color = Vec3.init(0.5, 0.5, 0.5),

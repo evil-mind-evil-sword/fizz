@@ -72,17 +72,16 @@ pub fn main() !void {
 
     print("\nEntity count: {d}\n", .{world.entityCount()});
 
-    // SLDS configuration
+    // SLDS configuration (ground at y=0 by default via environment config)
     const slds_config = SLDSConfig{
         .gravity = Vec3.init(0, -9.81, 0),
         .dt = 1.0 / 60.0,
-        .ground_height = 0.0,
     };
 
     print("\n=== SLDS Mode-Dependent Dynamics ===\n", .{});
 
     // Demonstrate SLDS matrices for different modes
-    const modes = [_]ContactMode{ .free, .ground, .supported, .agency };
+    const modes = [_]ContactMode{ .free, .environment, .supported, .agency };
     for (modes) |mode| {
         const matrices = SLDSMatrices.forMode(mode, Physics.standard, slds_config);
         print("\n  Mode: {s}\n", .{@tagName(mode)});
@@ -93,18 +92,18 @@ pub fn main() !void {
     print("\n=== Mode Transition Priors (Spelke Core Knowledge) ===\n", .{});
 
     // Demonstrate mode transition probabilities
-    print("\n  From GROUND mode, low speed (stability prior):\n", .{});
-    const stay_ground = ModeTransitionPrior.transitionProb(.ground, .ground, false, 0.01);
-    const leave_ground = ModeTransitionPrior.transitionProb(.ground, .free, false, 0.01);
-    print("    P(stay on ground) = {d:.3}\n", .{stay_ground});
-    print("    P(leave ground)   = {d:.3}\n", .{leave_ground});
+    print("\n  From ENVIRONMENT mode, low speed (stability prior):\n", .{});
+    const stay_env = ModeTransitionPrior.transitionProb(.environment, .environment, false, 0.01);
+    const leave_env = ModeTransitionPrior.transitionProb(.environment, .free, false, 0.01);
+    print("    P(stay on environment) = {d:.3}\n", .{stay_env});
+    print("    P(leave environment)   = {d:.3}\n", .{leave_env});
     print("    => Objects at rest tend to stay at rest\n", .{});
 
     print("\n  From FREE mode, contact detected:\n", .{});
-    const land = ModeTransitionPrior.transitionProb(.free, .ground, true, 0.5);
+    const land = ModeTransitionPrior.transitionProb(.free, .environment, true, 0.5);
     const bounce = ModeTransitionPrior.transitionProb(.free, .free, true, 0.5);
-    print("    P(land on ground) = {d:.3}\n", .{land});
-    print("    P(bounce off)     = {d:.3}\n", .{bounce});
+    print("    P(land on environment) = {d:.3}\n", .{land});
+    print("    P(bounce off)          = {d:.3}\n", .{bounce});
 
     print("\n=== Entity Queries ===\n", .{});
 

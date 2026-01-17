@@ -13,7 +13,7 @@ const Vec3 = fizz.Vec3;
 const Mat3 = fizz.Mat3;
 const Entity = fizz.Entity;
 const Label = fizz.Label;
-const PhysicsType = fizz.PhysicsType;
+const PhysicsParams = fizz.PhysicsParams;
 const GaussianVec3 = fizz.GaussianVec3;
 const Camera = fizz.Camera;
 const GaussianMixture = fizz.GaussianMixture;
@@ -36,7 +36,7 @@ pub fn main() !void {
     config.max_entities = 4;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.5;
     config.use_tempering = true;
@@ -62,13 +62,12 @@ pub fn main() !void {
     defer smc.deinit();
 
     // Ground truth: BOUNCY ball
-    const gt_physics: PhysicsType = .bouncy;
+    const gt_physics = PhysicsParams{ .elasticity = 0.9, .friction = 0.2 }; // Bouncy
     const gt_initial_pos = Vec3.init(0, 5, 0);
     const gt_initial_vel = Vec3.zero;
 
-    std.debug.print("Ground truth: {s} ball (elasticity={d:.2})\n", .{
-        @tagName(gt_physics),
-        gt_physics.elasticity(),
+    std.debug.print("Ground truth: bouncy ball (elasticity={d:.2})\n", .{
+        gt_physics.elasticity,
     });
     std.debug.print("Initial position: ({d:.1}, {d:.1}, {d:.1})\n\n", .{
         gt_initial_pos.x,
@@ -111,10 +110,10 @@ pub fn main() !void {
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
         // Ground collision
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
             const old_vel_y = gt_vel.y;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity;
             if (old_vel_y < -1.0) bounce_count += 1;
         }
 
@@ -126,8 +125,8 @@ pub fn main() !void {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = gt_physics,
-            .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+            .physics_params = gt_physics,
+            .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -171,15 +170,15 @@ pub fn main() !void {
             for (0..@min(5, smc.config.num_particles)) |p| {
                 const entity_idx = p * smc.config.max_entities;
                 const pos_y = smc.swarm.position_mean[entity_idx].y;
-                const ptype = smc.swarm.physics_type[entity_idx];
+                const params = smc.swarm.physics_params[entity_idx];
                 const weight = smc.weights[p];
                 const cam = smc.swarm.camera_poses[p];
                 // Compute this step's observation likelihood
                 const obs_ll = smc.observationLogLikelihood(p, observation);
-                std.debug.print("  P{d}: y={d:.3}, type={s}, cam=({d:.2},{d:.2},{d:.2}), yaw={d:.2}, w={d:.4}, obs_ll={d:.1}\n", .{
+                std.debug.print("  P{d}: y={d:.3}, e={d:.2}, cam=({d:.2},{d:.2},{d:.2}), yaw={d:.2}, w={d:.4}, obs_ll={d:.1}\n", .{
                     p,
                     pos_y,
-                    @tagName(ptype),
+                    params.elasticity,
                     cam.position.x,
                     cam.position.y,
                     cam.position.z,
@@ -191,20 +190,20 @@ pub fn main() !void {
             std.debug.print("---\n\n", .{});
         }
 
-        // Get posteriors
-        const posteriors = try smc.getPhysicsTypePosterior();
-        defer allocator.free(posteriors);
+        // Get physics beliefs
+        const beliefs = try smc.getPhysicsBelief();
+        defer allocator.free(beliefs);
 
-        if (posteriors.len > 0) {
+        if (beliefs.len > 0) {
             std.debug.print("{d:4} | {d:5.2} | {d:5.1} | {d:5.2} | {d:8.3} | {d:7.3} | {d:7.3} | {d:8.3}\n", .{
                 step,
                 gt_pos.y,
                 smc.effectiveSampleSize(),
                 smc.temperature,
-                posteriors[0][0], // standard
-                posteriors[0][1], // bouncy
-                posteriors[0][2], // sticky
-                posteriors[0][3], // slippery
+                beliefs[0].type_probabilities[0], // standard
+                beliefs[0].type_probabilities[1], // bouncy
+                beliefs[0].type_probabilities[2], // sticky
+                beliefs[0].type_probabilities[3], // slippery
             });
         }
     }
@@ -212,11 +211,11 @@ pub fn main() !void {
     std.debug.print("\n=== Summary ===\n", .{});
     std.debug.print("Bounces observed: {d}\n", .{bounce_count});
 
-    const final_posteriors = try smc.getPhysicsTypePosterior();
-    defer allocator.free(final_posteriors);
+    const final_beliefs = try smc.getPhysicsBelief();
+    defer allocator.free(final_beliefs);
 
-    if (final_posteriors.len > 0) {
-        const probs = final_posteriors[0];
+    if (final_beliefs.len > 0) {
+        const probs = final_beliefs[0].type_probabilities;
         var max_prob: f32 = 0;
         var max_idx: usize = 0;
         for (probs, 0..) |p, i| {
@@ -228,12 +227,13 @@ pub fn main() !void {
 
         const types = [_][]const u8{ "standard", "bouncy", "sticky", "slippery" };
         std.debug.print("MAP estimate: {s} (p={d:.3})\n", .{ types[max_idx], max_prob });
-        std.debug.print("Ground truth: {s}\n", .{@tagName(gt_physics)});
+        std.debug.print("Ground truth: bouncy (elasticity={d:.2})\n", .{gt_physics.elasticity});
 
-        if (max_idx == @intFromEnum(gt_physics)) {
+        // Bouncy = index 1
+        if (max_idx == 1) {
             std.debug.print("\n✓ Inference CORRECT!\n", .{});
         } else {
-            std.debug.print("\n✗ Inference incorrect (expected {s})\n", .{@tagName(gt_physics)});
+            std.debug.print("\n✗ Inference incorrect (expected bouncy)\n", .{});
         }
     }
 }

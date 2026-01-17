@@ -30,6 +30,15 @@ pub const association = @import("association/mod.zig");
 pub const crp = @import("crp/mod.zig");
 pub const smc_swarm = @import("smc/mod.zig");
 
+// Material trait system (domain-general vs domain-specific)
+pub const material = @import("material.zig");
+pub const Material = material.Material;
+pub const DefaultMaterial = material.DefaultMaterial;
+pub const LegacyMaterials = material.LegacyMaterials;
+
+// Conjugate priors for Rao-Blackwellized inference
+pub const priors = @import("priors.zig");
+
 // Legacy modules (being deprecated)
 pub const types = @import("types.zig");
 pub const dynamics = @import("dynamics.zig");
@@ -40,6 +49,7 @@ pub const smc = @import("smc.zig");
 pub const Vec3 = math.Vec3;
 pub const Vec2 = math.Vec2;
 pub const Mat3 = math.Mat3;
+pub const Mat2 = math.Mat2;
 
 // ============================================================================
 // New ECS types (preferred)
@@ -87,16 +97,19 @@ pub const EntityCountPosterior = crp.EntityCountPosterior;
 // ============================================================================
 pub const Entity = types.Entity;
 pub const Label = types.Label;
-/// DEPRECATED: Use Physics.standard, Physics.bouncy, etc. instead
-pub const PhysicsType = types.PhysicsType;
+pub const PhysicsParams = types.PhysicsParams;
+pub const PhysicsParamsUncertainty = types.PhysicsParamsUncertainty;
 pub const ContactMode = types.ContactMode;
 pub const TrackState = types.TrackState;
 pub const GaussianVec3 = types.GaussianVec3;
 pub const Appearance = types.Appearance;
-/// DEPRECATED: Use SLDSConfig instead
 pub const PhysicsConfig = types.PhysicsConfig;
 pub const Camera = types.Camera;
 pub const ProjectionResult = types.ProjectionResult;
+
+// Environment types (static geometry)
+pub const EnvironmentEntity = types.EnvironmentEntity;
+pub const EnvironmentConfig = types.EnvironmentConfig;
 
 pub const DynamicsMatrices = dynamics.DynamicsMatrices;
 pub const kalmanPredictPosition = dynamics.kalmanPredictPosition;
@@ -120,9 +133,24 @@ pub const Detection2D = gmm.Detection2D;
 pub const RayGaussian = gmm.RayGaussian;
 pub const backProjectionLogLikelihood = gmm.backProjectionLogLikelihood;
 
+// Sparse optical flow observation model (conjugate velocity)
+pub const FlowObservation = gmm.FlowObservation;
+pub const SparseFlowConfig = gmm.SparseFlowConfig;
+pub const computeSparseFlow = gmm.computeSparseFlow;
+
 pub const SMCConfig = smc.SMCConfig;
 pub const Particle = smc.Particle;
 pub const SMCState = smc.SMCState;
+pub const SurpriseTracker = smc.SurpriseTracker;
+
+// Conjugate prior types
+pub const InverseGamma = priors.InverseGamma;
+pub const Beta = priors.Beta;
+pub const Dirichlet = priors.Dirichlet;
+pub const PriorModeTransition = priors.ModeTransitionPrior;
+pub const MaterialPrior = priors.MaterialPrior;
+pub const SoftContact = priors.SoftContact;
+pub const ObservationNoiseState = priors.ObservationNoiseState;
 
 // =============================================================================
 // World State (Collection of Entities)
@@ -164,7 +192,7 @@ pub const World = struct {
         self: *World,
         position: Vec3,
         velocity: Vec3,
-        physics_type: PhysicsType,
+        physics_params: PhysicsParams,
     ) !*Entity {
         const label = Label{
             .birth_time = self.timestep,
@@ -172,7 +200,7 @@ pub const World = struct {
         };
         self.next_birth_index += 1;
 
-        const entity = Entity.initPoint(label, position, velocity, physics_type);
+        const entity = Entity.initPoint(label, position, velocity, physics_params);
         try self.entities.append(self.allocator, entity);
 
         return &self.entities.items[self.entities.items.len - 1];
@@ -301,6 +329,9 @@ test {
     _ = @import("dynamics.zig");
     _ = @import("gmm.zig");
     _ = @import("smc.zig");
+    _ = @import("material.zig");
+    _ = @import("priors.zig");
+    _ = @import("scenario_tests.zig");
     // New modules
     _ = @import("ecs/mod.zig");
     _ = @import("slds/mod.zig");

@@ -398,6 +398,86 @@ pub const Vec2 = struct {
 };
 
 // =============================================================================
+// 2x2 Matrix (for 2D covariance in optical flow)
+// =============================================================================
+
+/// 2x2 matrix stored column-major: [col0, col1]
+pub const Mat2 = struct {
+    /// Column-major storage: [m00, m10, m01, m11]
+    data: [4]f32,
+
+    pub const identity = Mat2{ .data = .{ 1, 0, 0, 1 } };
+    pub const zero = Mat2{ .data = .{ 0, 0, 0, 0 } };
+
+    /// Create diagonal matrix
+    pub fn diagonal(v: Vec2) Mat2 {
+        return .{ .data = .{ v.x, 0, 0, v.y } };
+    }
+
+    /// Create from elements (row-major input for convenience)
+    pub fn init(m00: f32, m01: f32, m10: f32, m11: f32) Mat2 {
+        // Convert row-major input to column-major storage
+        return .{ .data = .{ m00, m10, m01, m11 } };
+    }
+
+    /// Get element at (row, col)
+    pub fn get(self: Mat2, row: usize, col: usize) f32 {
+        return self.data[col * 2 + row];
+    }
+
+    /// Set element at (row, col)
+    pub fn set(self: *Mat2, row: usize, col: usize, val: f32) void {
+        self.data[col * 2 + row] = val;
+    }
+
+    /// Matrix-vector multiply
+    pub fn mulVec(self: Mat2, v: Vec2) Vec2 {
+        return .{
+            .x = self.get(0, 0) * v.x + self.get(0, 1) * v.y,
+            .y = self.get(1, 0) * v.x + self.get(1, 1) * v.y,
+        };
+    }
+
+    /// Determinant
+    pub fn determinant(self: Mat2) f32 {
+        return self.get(0, 0) * self.get(1, 1) - self.get(0, 1) * self.get(1, 0);
+    }
+
+    /// Inverse (returns null if singular)
+    pub fn inverse(self: Mat2) ?Mat2 {
+        const det = self.determinant();
+        if (@abs(det) < 1e-10) return null;
+        const inv_det = 1.0 / det;
+        return Mat2.init(
+            self.get(1, 1) * inv_det,
+            -self.get(0, 1) * inv_det,
+            -self.get(1, 0) * inv_det,
+            self.get(0, 0) * inv_det,
+        );
+    }
+
+    /// Add two matrices
+    pub fn add(self: Mat2, other: Mat2) Mat2 {
+        return .{ .data = .{
+            self.data[0] + other.data[0],
+            self.data[1] + other.data[1],
+            self.data[2] + other.data[2],
+            self.data[3] + other.data[3],
+        } };
+    }
+
+    /// Scale matrix
+    pub fn scale(self: Mat2, s: f32) Mat2 {
+        return .{ .data = .{
+            self.data[0] * s,
+            self.data[1] * s,
+            self.data[2] * s,
+            self.data[3] * s,
+        } };
+    }
+};
+
+// =============================================================================
 // Tests
 // =============================================================================
 

@@ -5,11 +5,15 @@ const dynamics = @import("dynamics.zig");
 const gmm = @import("gmm.zig");
 const swarm_mod = @import("smc/mod.zig");
 const crp = @import("crp/mod.zig");
+const material_mod = @import("material.zig");
+const priors = @import("priors.zig");
 
 const Vec3 = math.Vec3;
+const Vec2 = math.Vec2;
 const Mat3 = math.Mat3;
 const Entity = types.Entity;
-const PhysicsType = types.PhysicsType;
+const PhysicsParams = types.PhysicsParams;
+const PhysicsParamsUncertainty = types.PhysicsParamsUncertainty;
 const ContactMode = types.ContactMode;
 const TrackState = types.TrackState;
 const PhysicsConfig = types.PhysicsConfig;
@@ -17,14 +21,18 @@ const Camera = types.Camera;
 const CameraPose = types.CameraPose;
 const CameraIntrinsics = types.CameraIntrinsics;
 const GaussianVec3 = types.GaussianVec3;
+const Gaussian6D = types.Gaussian6D;
+const CovTriangle21 = types.CovTriangle21;
 const Label = types.Label;
 const SpatialRelationType = types.SpatialRelationType;
 const ObservationGrid = gmm.ObservationGrid;
+const AdaptedFlowConfig = gmm.AdaptedFlowConfig;
 const GaussianMixture = gmm.GaussianMixture;
 const backProjectionLogLikelihood = gmm.backProjectionLogLikelihood;
 const backProjectionLogLikelihoodWithDetections = gmm.backProjectionLogLikelihoodWithDetections;
 const Detection2D = gmm.Detection2D;
 const RayGaussian = gmm.RayGaussian;
+const Observation = gmm.Observation;
 
 // SoA particle swarm types
 const ParticleSwarm = swarm_mod.ParticleSwarm;
@@ -33,6 +41,11 @@ const covToTriangle = swarm_mod.covToTriangle;
 const triangleToCov = swarm_mod.triangleToCov;
 const ParticleWorldView = swarm_mod.ParticleWorldView;
 const particleWorld = swarm_mod.particleWorld;
+
+// Material trait types
+const Material = material_mod.Material;
+const LegacyMaterials = material_mod.LegacyMaterials;
+const DefaultMaterial = material_mod.DefaultMaterial;
 
 // =============================================================================
 // SMC Configuration
@@ -50,7 +63,19 @@ pub const SMCConfig = struct {
     ess_threshold: f32 = 0.5,
 
     /// Observation noise for likelihood (controls sharpness)
+    /// This is the initial/default value; if use_adaptive_noise is true,
+    /// the actual noise is learned via conjugate prior
     observation_noise: f32 = 0.3,
+
+    /// Use adaptive observation noise (Inverse-Gamma conjugate prior)
+    /// When true: Noise is learned from observation residuals
+    /// When false: Uses fixed observation_noise value
+    use_adaptive_noise: bool = false,
+
+    /// Inverse-Gamma prior parameters for observation noise (only used when use_adaptive_noise is true)
+    /// Default: α=3, β=0.27 gives prior mean ≈ 0.135 with reasonable uncertainty
+    observation_noise_prior_alpha: f32 = 3.0,
+    observation_noise_prior_beta: f32 = 0.27,
 
     /// Whether to use likelihood tempering
     use_tempering: bool = true,
@@ -99,24 +124,26 @@ pub const SMCConfig = struct {
     /// Minimum numerosity variance (prevents division by zero for count=0)
     min_numerosity_variance: f32 = 0.5,
 
-    /// Use back-projection observation model (conjugate Gaussian)
-    /// When true, uses detection extraction + ray-Gaussian overlap
-    /// When false, uses pixel-wise rendering comparison (legacy)
-    use_back_projection: bool = true,
-
     /// Depth prior mean for back-projection (distance from camera)
     back_projection_depth_mean: f32 = 10.0,
 
     /// Depth prior variance for back-projection
     back_projection_depth_var: f32 = 25.0,
 
-    /// Use proper Rao-Blackwellized observation update (RBPF)
-    /// When true: Uses unified Kalman update that updates both mean AND covariance,
-    ///            returns marginal likelihood for weighting (theoretically sound)
-    /// When false: Uses legacy separate updateWeights + lateralPositionUpdate
-    ///             (violates RBPF theory but kept for backwards compatibility)
-    /// References: Doucet et al. (2000), SMCP3 (Lew et al. 2023)
-    use_rbpf_observation: bool = true,
+    /// Initial position variance for entity initialization
+    /// Higher = less confident in initial position, more responsive to observations
+    initial_position_variance: f32 = 0.5,
+
+    /// Initial velocity variance for entity initialization
+    /// Higher = less confident in initial velocity, allows velocity learning
+    initial_velocity_variance: f32 = 1.0,
+
+    /// Position process noise (variance added per step)
+    /// Prevents filter from becoming overconfident
+    position_process_noise: f32 = 0.01,
+
+    /// Velocity process noise (variance added per step)
+    velocity_process_noise: f32 = 0.1,
 
     /// Use Metropolis-Hastings for camera yaw sampling (instead of discrete Gibbs)
     /// When true: Continuous MH proposals with Gaussian kernel (asymptotically exact)
@@ -138,17 +165,40 @@ pub const SMCConfig = struct {
     /// CRP configuration (only used when use_crp is true)
     crp_config: crp.CRPConfig = .{},
 
-    /// Get color for physics type (respects use_uniform_colors setting)
-    pub fn colorForPhysicsType(self: SMCConfig, ptype: PhysicsType) Vec3 {
+    /// Use sparse optical flow for velocity estimation
+    /// When true: Computes Lucas-Kanade flow between consecutive frames
+    /// and performs RBPF velocity updates (conjugate Gaussian)
+    use_flow_observations: bool = false,
+
+    /// Fallback flow config (used when adaptive flow is disabled for testing)
+    /// Note: Resolution-adaptive flow is always used by default
+    sparse_flow_config: gmm.SparseFlowConfig = .{},
+
+    /// Material model for dynamics parameters (friction, elasticity, etc.)
+    /// Default: LegacyMaterials (4-type system, backward compatible)
+    /// Use DefaultMaterial for domain-general mode (skips material Gibbs)
+    ///
+    /// Spelke core knowledge (always active):
+    /// - Continuity: Kalman tracking
+    /// - Solidity: Collision detection
+    /// - Support: ContactMode + gravity
+    /// - Permanence: TrackState
+    ///
+    /// Material properties are domain-specific and optional.
+    /// When material.num_types == 1, Gibbs sampling skips material inference.
+    material: *const Material = &LegacyMaterials.instance,
+
+    /// Get color for material index (respects use_uniform_colors setting)
+    pub fn colorForMaterialIndex(self: SMCConfig, idx: usize) Vec3 {
         if (self.use_uniform_colors) {
             return self.uniform_color;
         }
-        return switch (ptype) {
-            .standard => Vec3.init(1.0, 0.3, 0.3),
-            .bouncy => Vec3.init(0.3, 1.0, 0.3),
-            .sticky => Vec3.init(0.3, 0.3, 1.0),
-            .slippery => Vec3.init(1.0, 1.0, 0.3),
-        };
+        return self.material.color(idx);
+    }
+
+    /// Check if we're in domain-general mode (no material inference)
+    pub fn isDomainGeneral(self: SMCConfig) bool {
+        return self.material.isDomainGeneral();
     }
 };
 
@@ -279,6 +329,76 @@ pub const Particle = struct {
 };
 
 // =============================================================================
+// Surprise Tracker (Violation of Expectation)
+// =============================================================================
+
+/// Tracks surprise signal for detecting physical violations
+/// Based on: negative log-likelihood compared to running expectation
+/// High surprise = observation inconsistent with learned physics model
+pub const SurpriseTracker = struct {
+    /// Current observation log-likelihood (weighted average across particles)
+    current_log_likelihood: f64 = 0,
+
+    /// Exponential moving average of log-likelihood (baseline expectation)
+    expected_log_likelihood: f64 = 0,
+
+    /// EMA decay rate (higher = faster adaptation, lower = longer memory)
+    decay_rate: f32 = 0.1,
+
+    /// Number of observations seen
+    n_observations: u32 = 0,
+
+    /// Whether tracker has been initialized (need at least 1 observation)
+    initialized: bool = false,
+
+    /// Current surprise signal: expected - observed
+    /// Positive = surprising (worse than expected)
+    /// Negative = better than expected
+    /// Near zero = as expected
+    pub fn surprise(self: SurpriseTracker) f32 {
+        if (!self.initialized) return 0;
+        return @floatCast(self.expected_log_likelihood - self.current_log_likelihood);
+    }
+
+    /// Update with new observation log-likelihood
+    pub fn update(self: *SurpriseTracker, log_likelihood: f64) void {
+        self.current_log_likelihood = log_likelihood;
+        self.n_observations += 1;
+
+        if (!self.initialized) {
+            // First observation: initialize EMA
+            self.expected_log_likelihood = log_likelihood;
+            self.initialized = true;
+        } else {
+            // Update EMA: E = α*current + (1-α)*E
+            const alpha: f64 = @floatCast(self.decay_rate);
+            self.expected_log_likelihood = alpha * log_likelihood +
+                (1.0 - alpha) * self.expected_log_likelihood;
+        }
+    }
+
+    /// Check if surprise exceeds threshold (VoE detection)
+    pub fn isSurprising(self: SurpriseTracker, threshold: f32) bool {
+        return self.surprise() > threshold;
+    }
+
+    /// Reset tracker (new episode)
+    pub fn reset(self: *SurpriseTracker) void {
+        self.current_log_likelihood = 0;
+        self.expected_log_likelihood = 0;
+        self.n_observations = 0;
+        self.initialized = false;
+    }
+
+    /// Get normalized surprise (0-1 scale via sigmoid)
+    pub fn normalizedSurprise(self: SurpriseTracker) f32 {
+        const s = self.surprise();
+        // Sigmoid with reasonable scaling (surprise of 5 nats ≈ 0.99)
+        return 1.0 / (1.0 + @exp(-s / 2.0));
+    }
+};
+
+// =============================================================================
 // SMC State
 // =============================================================================
 
@@ -308,6 +428,26 @@ pub const SMCState = struct {
     /// Random number generator
     rng: std.Random,
 
+    /// Surprise tracker for VoE detection
+    surprise_tracker: SurpriseTracker = .{},
+
+    /// Observation noise state (conjugate prior for adaptive noise estimation)
+    /// Uses Inverse-Gamma prior, updated with observation residuals
+    observation_noise_state: ?priors.ObservationNoiseState = null,
+
+    /// Previous frame storage for optical flow computation
+    /// Stored as raw pixel data to avoid holding onto ObservationGrid memory
+    prev_frame_data: ?[]Observation = null,
+    prev_frame_width: u32 = 0,
+    prev_frame_height: u32 = 0,
+
+    /// Previous frame detections for flow matching
+    prev_detections: ?[]Detection2D = null,
+
+    /// Mode transition prior (Dirichlet for learning transition probabilities)
+    /// Encodes Spelke core knowledge: objects at rest tend to stay at rest
+    mode_transition_prior: priors.ModeTransitionPrior = priors.ModeTransitionPrior.spelke_prior,
+
     /// Initialize SMC state
     pub fn init(
         allocator: std.mem.Allocator,
@@ -332,6 +472,15 @@ pub const SMCState = struct {
         const weights = try allocator.alloc(f32, config.num_particles);
         @memset(weights, 1.0 / @as(f32, @floatFromInt(config.num_particles)));
 
+        // Initialize adaptive noise state if enabled
+        const noise_state: ?priors.ObservationNoiseState = if (config.use_adaptive_noise)
+            priors.ObservationNoiseState.init(.{
+                .alpha = config.observation_noise_prior_alpha,
+                .beta = config.observation_noise_prior_beta,
+            })
+        else
+            null;
+
         return .{
             .swarm = swarm,
             .label_sets = label_sets,
@@ -341,6 +490,52 @@ pub const SMCState = struct {
             .config = config,
             .allocator = allocator,
             .rng = rng,
+            .observation_noise_state = noise_state,
+        };
+    }
+
+    /// Get current effective observation noise
+    /// Returns posterior mean if adaptive, otherwise fixed config value
+    pub fn effectiveObservationNoise(self: SMCState) f32 {
+        if (self.observation_noise_state) |state| {
+            return @sqrt(state.noiseEstimate()); // Convert variance to std dev
+        }
+        return self.config.observation_noise;
+    }
+
+    /// Update observation noise state with residual (call during observation step)
+    pub fn updateNoiseEstimate(self: *SMCState, residual: Vec3) void {
+        if (self.observation_noise_state) |*state| {
+            state.observe(residual);
+        }
+    }
+
+    /// Observe a mode transition (updates Dirichlet prior)
+    pub fn observeModeTransition(self: *SMCState, from: ContactMode, to: ContactMode) void {
+        const from_mode = contactModeToModeEnum(from);
+        const to_mode = contactModeToModeEnum(to);
+        self.mode_transition_prior.observe(from_mode, to_mode);
+    }
+
+    /// Get posterior transition probability
+    pub fn modeTransitionProb(self: SMCState, from: ContactMode, to: ContactMode) f32 {
+        const from_mode = contactModeToModeEnum(from);
+        const to_mode = contactModeToModeEnum(to);
+        return self.mode_transition_prior.posteriorProb(from_mode, to_mode);
+    }
+
+    /// Reset mode transition counts (for new episode)
+    pub fn resetModeTransitionCounts(self: *SMCState) void {
+        self.mode_transition_prior.resetCounts();
+    }
+
+    /// Helper to convert ContactMode to ModeTransitionPrior.Mode
+    fn contactModeToModeEnum(cm: ContactMode) priors.ModeTransitionPrior.Mode {
+        return switch (cm) {
+            .free => .free,
+            .environment => .environment,
+            .entity => .supported,
+            .agency => .agency,
         };
     }
 
@@ -352,6 +547,14 @@ pub const SMCState = struct {
         }
         self.allocator.free(self.label_sets);
         self.allocator.free(self.weights);
+
+        // Free previous frame data if allocated
+        if (self.prev_frame_data) |data| {
+            self.allocator.free(data);
+        }
+        if (self.prev_detections) |dets| {
+            self.allocator.free(dets);
+        }
     }
 
     /// Build Entity array from swarm particle data (for GMM compatibility)
@@ -367,6 +570,13 @@ pub const SMCState = struct {
         for (slice.start..slice.end) |i| {
             if (!self.swarm.alive[i]) continue;
 
+            // Derive color from physics params: elasticity -> red, friction -> green
+            const pp = self.swarm.physics_params[i];
+            const color = if (self.config.use_uniform_colors)
+                self.config.uniform_color
+            else
+                Vec3.init(pp.elasticity, 0.5, 1.0 - pp.friction);
+
             entities[out_idx] = Entity{
                 .label = self.swarm.label[i],
                 .position = GaussianVec3{
@@ -377,12 +587,12 @@ pub const SMCState = struct {
                     .mean = self.swarm.velocity_mean[i],
                     .cov = swarm_mod.triangleToCov(self.swarm.velocity_cov[i]),
                 },
-                .physics_type = self.swarm.physics_type[i],
+                .physics_params = pp,
                 .contact_mode = self.swarm.contact_mode[i],
                 .track_state = self.swarm.track_state[i],
                 .occlusion_count = self.swarm.occlusion_count[i],
                 .appearance = .{
-                    .color = self.config.colorForPhysicsType(self.swarm.physics_type[i]),
+                    .color = color,
                     .opacity = 1.0,
                     .radius = 0.5,
                 },
@@ -401,8 +611,9 @@ pub const SMCState = struct {
         initial_positions: []const Vec3,
         initial_velocities: []const Vec3,
     ) void {
-        const physics_types = [_]PhysicsType{ .standard, .bouncy, .sticky, .slippery };
-        const init_cov = covToTriangle(Mat3.diagonal(Vec3.splat(0.001)));
+        // Use config values for initial uncertainty (allows observation-responsive tracking)
+        const init_pos_cov = covToTriangle(Mat3.diagonal(Vec3.splat(self.config.initial_position_variance)));
+        const init_vel_cov = covToTriangle(Mat3.diagonal(Vec3.splat(self.config.initial_velocity_variance)));
 
         for (0..self.swarm.num_particles) |p| {
             // Sample camera pose from prior
@@ -421,10 +632,6 @@ pub const SMCState = struct {
 
             // Add initial entities
             for (initial_positions, initial_velocities, 0..) |pos, vel, idx| {
-                // Sample physics type uniformly from prior
-                const ptype_idx = self.rng.intRangeAtMost(usize, 0, physics_types.len - 1);
-                const ptype = physics_types[ptype_idx];
-
                 const label = Label{
                     .birth_time = 0,
                     .birth_index = @intCast(idx),
@@ -432,16 +639,17 @@ pub const SMCState = struct {
 
                 const entity_view = EntityView{
                     .position_mean = pos,
-                    .position_cov = init_cov,
+                    .position_cov = init_pos_cov,
                     .velocity_mean = vel,
-                    .velocity_cov = init_cov,
-                    .physics_type = ptype,
+                    .velocity_cov = init_vel_cov,
+                    .physics_params = PhysicsParams.prior, // Start with weak prior
+                    .physics_params_uncertainty = PhysicsParamsUncertainty.weak_prior,
                     .contact_mode = .free,
                     .track_state = .detected,
                     .label = label,
                     .occlusion_count = 0,
                     .alive = true,
-                    .color = Vec3.init(0.5, 0.5, 0.5),
+                    .color = self.config.colorForMaterialIndex(0), // Default color
                     .opacity = 1.0,
                     .radius = 0.5,
                     .goal_type = .none,
@@ -509,6 +717,29 @@ pub const SMCState = struct {
         }
     }
 
+    /// Compute weighted mean log-likelihood and update surprise tracker
+    fn updateSurpriseTracker(self: *SMCState) void {
+        // Compute weighted average log-likelihood across particles
+        var mean_log_lik: f64 = 0;
+        for (self.swarm.log_weights, self.weights) |log_w, w| {
+            // Use normalized weight to compute expectation
+            mean_log_lik += @as(f64, w) * log_w;
+        }
+
+        // Update surprise tracker with observation log-likelihood
+        self.surprise_tracker.update(mean_log_lik);
+    }
+
+    /// Get current surprise signal (for external monitoring/VoE detection)
+    pub fn currentSurprise(self: SMCState) f32 {
+        return self.surprise_tracker.surprise();
+    }
+
+    /// Check if current observation is surprising (VoE detection)
+    pub fn isObservationSurprising(self: SMCState, threshold: f32) bool {
+        return self.surprise_tracker.isSurprising(threshold);
+    }
+
     /// Systematic resampling using SoA layout
     /// Performance: Zero-allocation after first call (uses swap buffers)
     pub fn resample(self: *SMCState) !void {
@@ -554,7 +785,8 @@ pub const SMCState = struct {
             @memcpy(swap.position_cov[dst_start..][0..max_e], self.swarm.position_cov[src_start..][0..max_e]);
             @memcpy(swap.velocity_mean[dst_start..][0..max_e], self.swarm.velocity_mean[src_start..][0..max_e]);
             @memcpy(swap.velocity_cov[dst_start..][0..max_e], self.swarm.velocity_cov[src_start..][0..max_e]);
-            @memcpy(swap.physics_type[dst_start..][0..max_e], self.swarm.physics_type[src_start..][0..max_e]);
+            @memcpy(swap.physics_params[dst_start..][0..max_e], self.swarm.physics_params[src_start..][0..max_e]);
+            @memcpy(swap.physics_params_uncertainty[dst_start..][0..max_e], self.swarm.physics_params_uncertainty[src_start..][0..max_e]);
             @memcpy(swap.contact_mode[dst_start..][0..max_e], self.swarm.contact_mode[src_start..][0..max_e]);
             @memcpy(swap.track_state[dst_start..][0..max_e], self.swarm.track_state[src_start..][0..max_e]);
             @memcpy(swap.label[dst_start..][0..max_e], self.swarm.label[src_start..][0..max_e]);
@@ -568,6 +800,15 @@ pub const SMCState = struct {
             @memcpy(swap.spatial_distance[dst_start..][0..max_e], self.swarm.spatial_distance[src_start..][0..max_e]);
             @memcpy(swap.spatial_tolerance[dst_start..][0..max_e], self.swarm.spatial_tolerance[src_start..][0..max_e]);
 
+            // Copy 6D coupled state (critical for cross-covariance preservation!)
+            @memcpy(swap.state_mean[dst_start..][0..max_e], self.swarm.state_mean[src_start..][0..max_e]);
+            @memcpy(swap.state_cov[dst_start..][0..max_e], self.swarm.state_cov[src_start..][0..max_e]);
+
+            // Copy appearance (needed for identity tracking)
+            @memcpy(swap.color[dst_start..][0..max_e], self.swarm.color[src_start..][0..max_e]);
+            @memcpy(swap.opacity[dst_start..][0..max_e], self.swarm.opacity[src_start..][0..max_e]);
+            @memcpy(swap.radius[dst_start..][0..max_e], self.swarm.radius[src_start..][0..max_e]);
+
             // Copy per-particle data
             swap.camera_poses[i] = self.swarm.camera_poses[ancestor];
             swap.entity_counts[i] = self.swarm.entity_counts[ancestor];
@@ -578,7 +819,8 @@ pub const SMCState = struct {
         @memcpy(self.swarm.position_cov, swap.position_cov);
         @memcpy(self.swarm.velocity_mean, swap.velocity_mean);
         @memcpy(self.swarm.velocity_cov, swap.velocity_cov);
-        @memcpy(self.swarm.physics_type, swap.physics_type);
+        @memcpy(self.swarm.physics_params, swap.physics_params);
+        @memcpy(self.swarm.physics_params_uncertainty, swap.physics_params_uncertainty);
         @memcpy(self.swarm.contact_mode, swap.contact_mode);
         @memcpy(self.swarm.track_state, swap.track_state);
         @memcpy(self.swarm.label, swap.label);
@@ -591,6 +833,11 @@ pub const SMCState = struct {
         @memcpy(self.swarm.spatial_reference, swap.spatial_reference);
         @memcpy(self.swarm.spatial_distance, swap.spatial_distance);
         @memcpy(self.swarm.spatial_tolerance, swap.spatial_tolerance);
+        @memcpy(self.swarm.state_mean, swap.state_mean);
+        @memcpy(self.swarm.state_cov, swap.state_cov);
+        @memcpy(self.swarm.color, swap.color);
+        @memcpy(self.swarm.opacity, swap.opacity);
+        @memcpy(self.swarm.radius, swap.radius);
         @memcpy(self.swarm.camera_poses, swap.camera_poses);
         @memcpy(self.swarm.entity_counts, swap.entity_counts);
 
@@ -602,17 +849,17 @@ pub const SMCState = struct {
     }
 
     /// Compute dynamics log-likelihood for a single entity given physics type
-    /// Uses Kalman likelihood: p(x_t | x_{t-1}, type)
+    /// Uses Kalman likelihood: p(x_t | x_{t-1}, params)
     fn dynamicsLogLikelihood(
         self: SMCState,
         entity: Entity,
         prev_state: PreviousState,
-        physics_type: PhysicsType,
+        physics_params: PhysicsParams,
     ) f32 {
-        // Get dynamics matrices for this physics type
-        const matrices = dynamics.DynamicsMatrices.forContactMode(
+        // Get dynamics matrices for these physics params
+        const matrices = dynamics.DynamicsMatrices.forContactModeWithParams(
             entity.contact_mode,
-            physics_type,
+            physics_params,
             self.config.physics,
             Vec3.unit_y,
         );
@@ -782,6 +1029,7 @@ pub const SMCState = struct {
             self.swarm.log_weights[p] += self.temperature * @as(f64, log_lik);
         }
         self.normalizeWeights();
+        self.updateSurpriseTracker();
     }
 
     /// Compute observation log-likelihood for a particle (by index)
@@ -802,51 +1050,17 @@ pub const SMCState = struct {
         var particle_gmm = GaussianMixture.fromEntities(entities, self.allocator) catch return -std.math.inf(f32);
         defer particle_gmm.deinit();
 
-        var log_lik: f32 = 0;
-
-        if (self.config.use_back_projection) {
-            // NEW: Back-projection observation model (conjugate Gaussian)
-            // Extracts detections from observed image, back-projects to ray-Gaussians,
-            // computes overlap with particle's 3D GMM hypothesis
-            log_lik = backProjectionLogLikelihood(
-                observation,
-                particle_gmm,
-                camera,
-                self.config.back_projection_depth_mean,
-                self.config.back_projection_depth_var,
-                self.allocator,
-            );
-        } else {
-            // LEGACY: Pixel-wise rendering comparison (non-conjugate)
-            // Render expected observation from particle's hypothesized viewpoint
-            var expected = ObservationGrid.init(
-                observation.width,
-                observation.height,
-                self.allocator,
-            ) catch return -std.math.inf(f32);
-            defer expected.deinit();
-
-            expected.renderGMM(particle_gmm, camera, 64);
-
-            // Compute pixel-wise log-likelihood
-            const noise = self.config.observation_noise;
-            const noise_sq = noise * noise;
-
-            for (0..observation.height) |yi| {
-                for (0..observation.width) |xi| {
-                    const x: u32 = @intCast(xi);
-                    const y: u32 = @intCast(yi);
-
-                    const obs = observation.get(x, y);
-                    const exp = expected.get(x, y);
-
-                    // Color likelihood (Gaussian)
-                    const color_diff = obs.color.sub(exp.color);
-                    const color_sq_dist = color_diff.dot(color_diff);
-                    log_lik += -color_sq_dist / (2.0 * noise_sq);
-                }
-            }
-        }
+        // Back-projection observation model (conjugate Gaussian)
+        // Extracts detections from observed image, back-projects to ray-Gaussians,
+        // computes overlap with particle's 3D GMM hypothesis
+        var log_lik: f32 = backProjectionLogLikelihood(
+            observation,
+            particle_gmm,
+            camera,
+            self.config.back_projection_depth_mean,
+            self.config.back_projection_depth_var,
+            self.allocator,
+        );
 
         // Add spatial relation likelihood (Phase 2b)
         const spatial_log_lik = self.spatialRelationLogLikelihood(particle_idx);
@@ -868,16 +1082,17 @@ pub const SMCState = struct {
         }
 
         self.normalizeWeights();
+        self.updateSurpriseTracker();
     }
 
     /// Compute dynamics log-likelihood for SoA entity data
-    /// Compares predicted position under given physics type vs actual position
+    /// Compares predicted position under given physics params vs actual position
     /// Bug 1 fix: Use prev_contact_mode (saved before physics step) to detect bounces
     /// Bug 4 fix: Apply elasticity to post-gravity velocity, not prev_vel
     fn swarmDynamicsLogLikelihood(
         self: SMCState,
         entity_idx: usize,
-        physics_type: PhysicsType,
+        physics_params: PhysicsParams,
     ) f32 {
         // Get previous and current states
         const prev_pos = self.swarm.prev_position_mean[entity_idx];
@@ -886,30 +1101,85 @@ pub const SMCState = struct {
         // Bug 1 fix: Use prev_contact_mode to know if we WERE at ground before step
         const prev_contact_mode = self.swarm.prev_contact_mode[entity_idx];
 
-        // Get dynamics matrices for this physics type
-        const matrices = dynamics.DynamicsMatrices.forContactMode(
+        // Get dynamics matrices for these physics params
+        const matrices = dynamics.DynamicsMatrices.forContactModeWithParams(
             prev_contact_mode,
-            physics_type,
+            physics_params,
             self.config.physics,
             Vec3.unit_y,
         );
 
-        // Predict what position WOULD be under this physics type
+        // Predict what position WOULD be under these physics params
         // Step 1: Apply gravity to get post-gravity velocity
         var predicted_vel = matrices.B_vel.mulVec(prev_vel).add(matrices.gravity.scale(matrices.dt));
 
-        // Step 2: Check if we hit ground during this step
+        // Step 2: Check if we hit environment during this step
         // Bug 4 fix: Apply elasticity to predicted_vel (post-gravity), not prev_vel
+        const ground_height = self.config.physics.groundHeight();
         const predicted_y_before_bounce = prev_pos.y + predicted_vel.y * matrices.dt;
-        if (predicted_y_before_bounce < self.config.physics.ground_height and predicted_vel.y < 0) {
+        if (predicted_y_before_bounce < ground_height and predicted_vel.y < 0) {
             // Ball would go through ground - apply bounce
-            predicted_vel.y = -predicted_vel.y * physics_type.elasticity();
+            predicted_vel.y = -predicted_vel.y * physics_params.elasticity;
         }
 
         var predicted_pos = prev_pos.add(predicted_vel.scale(matrices.dt));
-        // Clamp to ground
-        if (predicted_pos.y < self.config.physics.ground_height) {
-            predicted_pos.y = self.config.physics.ground_height;
+        // Clamp to environment
+        if (predicted_pos.y < ground_height) {
+            predicted_pos.y = ground_height;
+        }
+
+        // Compute likelihood: how well does predicted match actual?
+        const diff = curr_pos.sub(predicted_pos);
+        const dist_sq = diff.dot(diff);
+
+        // Gaussian likelihood with fixed process noise variance
+        const noise_var = self.config.physics.process_noise * matrices.dt * matrices.dt + 0.01;
+        return -dist_sq / (2.0 * noise_var);
+    }
+
+    /// Compute dynamics log-likelihood using material interface
+    /// Same logic as swarmDynamicsLogLikelihood but uses material trait for parameters
+    fn swarmDynamicsLogLikelihoodMaterial(
+        self: SMCState,
+        entity_idx: usize,
+        material_idx: usize,
+    ) f32 {
+        const mat = self.config.material;
+
+        // Get previous and current states
+        const prev_pos = self.swarm.prev_position_mean[entity_idx];
+        const prev_vel = self.swarm.prev_velocity_mean[entity_idx];
+        const curr_pos = self.swarm.position_mean[entity_idx];
+        const prev_contact_mode = self.swarm.prev_contact_mode[entity_idx];
+
+        // Get material parameters
+        const friction = mat.friction(material_idx);
+        const elasticity_val = mat.elasticity(material_idx);
+        const process_noise = mat.processNoise(material_idx);
+
+        // Build dynamics matrices using material parameters
+        const dt = self.config.physics.dt;
+        const vel_decay = 1.0 - friction * dt;
+
+        // Predict velocity with friction and gravity
+        var predicted_vel = prev_vel.scale(vel_decay).add(self.config.physics.gravity.scale(dt));
+
+        // For environment contact, constrain vertical component
+        if (prev_contact_mode == .environment) {
+            predicted_vel.y = @max(0, predicted_vel.y);
+        }
+
+        // Check if we hit environment during this step - apply elasticity
+        const ground_height = self.config.physics.groundHeight();
+        const predicted_y_before_bounce = prev_pos.y + predicted_vel.y * dt;
+        if (predicted_y_before_bounce < ground_height and predicted_vel.y < 0) {
+            predicted_vel.y = -predicted_vel.y * elasticity_val;
+        }
+
+        var predicted_pos = prev_pos.add(predicted_vel.scale(dt));
+        // Clamp to environment
+        if (predicted_pos.y < ground_height) {
+            predicted_pos.y = ground_height;
         }
 
         // Compute likelihood: how well does predicted match actual?
@@ -917,70 +1187,26 @@ pub const SMCState = struct {
         const dist_sq = diff.dot(diff);
 
         // Gaussian likelihood with process noise variance
-        const noise_var = physics_type.processNoise() * matrices.dt * matrices.dt + 0.01;
+        const noise_var = process_noise * dt * dt + 0.01;
         return -dist_sq / (2.0 * noise_var);
     }
 
-    /// Gibbs rejuvenation: resample discrete variables
-    /// 1. Camera yaw (discretized) - targets observation likelihood
-    /// 2. Physics types - targets dynamics likelihood
+    /// Gibbs rejuvenation: resample discrete camera pose variables
+    /// Physics parameters are now inferred continuously via Bayesian updates
+    /// in bounce handling, not through discrete Gibbs sampling.
     pub fn gibbsRejuvenation(
         self: *SMCState,
         observation: ObservationGrid,
     ) void {
-        const physics_types = [_]PhysicsType{ .standard, .bouncy, .sticky, .slippery };
-
         // Extract detections ONCE for all particles (fixes O(n*k) -> O(1) performance)
         const detections = Detection2D.extractFromGrid(observation, self.allocator) catch return;
         defer self.allocator.free(detections);
 
         for (0..self.swarm.num_particles) |p| {
             for (0..self.config.gibbs_sweeps) |_| {
-                // Step 1: Camera yaw move (Gibbs or MH based on config)
-                // Only if back-projection is enabled
-                if (self.config.use_back_projection) {
-                    self.selectYawSamplingMethod(p, observation, detections);
-                }
-
-                // Step 2: Gibbs move on physics types (per entity)
-                const slice = self.swarm.particleSlice(p);
-                for (slice.start..slice.end) |i| {
-                    if (!self.swarm.alive[i]) continue;
-
-                    // Compute unnormalized log probabilities for each physics type
-                    var log_probs: [4]f32 = undefined;
-                    var max_log: f32 = -std.math.inf(f32);
-
-                    for (physics_types, 0..) |ptype, j| {
-                        log_probs[j] = self.swarmDynamicsLogLikelihood(i, ptype);
-                        max_log = @max(max_log, log_probs[j]);
-                    }
-
-                    // Convert to normalized probabilities (softmax)
-                    var probs: [4]f32 = undefined;
-                    var sum: f32 = 0;
-                    for (log_probs, 0..) |lp, j| {
-                        probs[j] = @exp(lp - max_log);
-                        sum += probs[j];
-                    }
-                    for (&probs) |*pp| {
-                        pp.* /= sum;
-                    }
-
-                    // Sample from categorical distribution
-                    const u = self.rng.float(f32);
-                    var cumsum: f32 = 0;
-                    var sampled_idx: usize = 0;
-                    for (probs, 0..) |prob, j| {
-                        cumsum += prob;
-                        if (u < cumsum) {
-                            sampled_idx = j;
-                            break;
-                        }
-                    }
-
-                    self.swarm.physics_type[i] = physics_types[sampled_idx];
-                }
+                // Camera yaw move (Gibbs or MH based on config)
+                // This is always domain-general (camera pose is core knowledge)
+                self.selectYawSamplingMethod(p, observation, detections);
             }
         }
     }
@@ -1175,33 +1401,206 @@ pub const SMCState = struct {
     // and state update separately.
     // =========================================================================
 
-    /// Rao-Blackwellized observation update for a single entity
+    /// Rao-Blackwellized observation update for 6D coupled state
+    /// Position observation updates BOTH position AND velocity via cross-covariance
     /// Returns marginal log-likelihood for particle weighting
-    /// Updates position_mean AND position_cov via proper Kalman update
-    fn rbpfEntityObservationUpdate(
+    fn rbpfEntityObservationUpdate6D(
         self: *SMCState,
         entity_idx: usize,
         observation_3d: Vec3,
         observation_cov: Mat3,
     ) f32 {
-        // Get current Gaussian belief
-        const prior_mean = self.swarm.position_mean[entity_idx];
-        const prior_cov_tri = self.swarm.position_cov[entity_idx];
+        // Get current 6D Gaussian belief
+        const prior = self.swarm.getState6D(entity_idx);
+
+        // Perform 6D Kalman update (updates position AND velocity via cross-covariance)
+        const result = dynamics.kalmanUpdate6D(prior, observation_3d, observation_cov);
+
+        // Write back updated state (this also syncs factored arrays)
+        self.swarm.setState6D(entity_idx, result.state);
+
+        return result.log_lik;
+    }
+
+    /// Project 3D velocity to 2D image plane velocity (pixels/frame)
+    /// Uses pinhole camera model: v_2d = (f/z) * v_3d_xy - (f*x/z²) * v_z
+    /// Simplified for small motions: v_2d ≈ (f/z) * v_3d_xy
+    fn projectVelocityTo2D(
+        self: *SMCState,
+        entity_idx: usize,
+        camera: Camera,
+        _: u32, // image_width (unused, symmetry with height)
+        image_height: u32,
+    ) Vec2 {
+        const pos = self.swarm.position_mean[entity_idx];
+        const vel = self.swarm.velocity_mean[entity_idx];
+
+        // Transform to camera coordinates
+        const rel_pos = pos.sub(camera.position);
+
+        // Compute depth (distance along view direction)
+        const view_dir = camera.target.sub(camera.position).normalize();
+        const depth = @max(0.1, rel_pos.dot(view_dir));
+
+        // Focal length in pixels (from FOV)
+        const half_h: f32 = @floatFromInt(image_height / 2);
+        const focal_pixels = half_h / @tan(camera.fov / 2.0);
+
+        // Project velocity to image plane
+        // For small depth variations, v_2d ≈ (f/z) * v_xy
+        const scale = focal_pixels / depth;
+
+        // Get camera right and up vectors for projection
+        const right = view_dir.cross(camera.up).normalize();
+        const up = right.cross(view_dir).normalize();
+
+        // Project velocity onto image plane axes
+        const v_right = vel.dot(right);
+        const v_up = vel.dot(up);
+
+        return Vec2.init(v_right * scale, -v_up * scale); // Flip Y for image coordinates
+    }
+
+    /// Rao-Blackwellized velocity update for a single entity using optical flow
+    /// Returns marginal log-likelihood for particle weighting
+    ///
+    /// Updates velocity_mean and velocity_cov using approximate Kalman update:
+    /// - Gains computed per-axis in 2D flow space: K = σ²_prior / (σ²_prior + R)
+    /// - Covariance rotated to camera basis (right, up, view_dir)
+    /// - Diagonal scaling applied: (1-K) reduction on right/up, identity on view_dir
+    /// - Rotated back to world frame, preserving full covariance structure
+    ///
+    /// Depth (view_dir) variance is EXACTLY preserved for any camera orientation.
+    /// The rotation-based approach maintains PSD by construction (D*C*D with D>0).
+    fn rbpfEntityVelocityUpdate(
+        self: *SMCState,
+        entity_idx: usize,
+        flow_obs: gmm.FlowObservation,
+        camera: Camera,
+        image_width: u32,
+        image_height: u32,
+    ) f32 {
+        // Get current velocity belief
+        const prior_vel = self.swarm.velocity_mean[entity_idx];
+        const prior_cov_tri = self.swarm.velocity_cov[entity_idx];
         const prior_cov = triangleToCov(prior_cov_tri);
 
-        const prior = GaussianVec3{ .mean = prior_mean, .cov = prior_cov };
+        // Project expected velocity to 2D
+        const expected_flow = self.projectVelocityTo2D(entity_idx, camera, image_width, image_height);
 
-        // Compute marginal log-likelihood BEFORE update
-        // This is p(y | prior) = N(y; μ_prior, Σ_prior + R)
-        const marginal_ll = dynamics.kalmanLogLikelihood(prior, observation_3d, observation_cov);
+        // Observation model: flow = H * velocity + noise
+        // H is the projection Jacobian (approximated as constant scale factor)
+        // For simplicity, we use a 2D observation model on the XY velocity components
 
-        // Perform Kalman update (updates BOTH mean and covariance)
-        // posterior = p(x | y, prior)
-        const posterior = dynamics.kalmanUpdate(prior, observation_3d, observation_cov);
+        // Compute residual in 2D
+        const residual = flow_obs.flow.sub(expected_flow);
 
-        // Write back updated state
-        self.swarm.position_mean[entity_idx] = posterior.mean;
-        self.swarm.position_cov[entity_idx] = covToTriangle(posterior.cov);
+        // Compute marginal log-likelihood using the flow observation's logLikelihood
+        // (uses heteroscedastic covariance from Lucas-Kanade)
+        const marginal_ll = flow_obs.logLikelihood(expected_flow);
+
+        // For the Kalman update, we need to lift the 2D observation to 3D velocity space
+        // Simplified approach: update the XZ velocity components based on flow
+        // (assuming camera is looking toward -Z, so image X ≈ world X, image Y ≈ world Y)
+
+        // Get camera orientation for proper axis mapping
+        const view_dir = camera.target.sub(camera.position).normalize();
+        const right = view_dir.cross(camera.up).normalize();
+        const up = right.cross(view_dir).normalize();
+
+        // Compute depth for velocity scaling
+        const pos = self.swarm.position_mean[entity_idx];
+        const rel_pos = pos.sub(camera.position);
+        const depth = @max(0.1, rel_pos.dot(view_dir));
+        const half_h: f32 = @floatFromInt(image_height / 2);
+        const focal_pixels = half_h / @tan(camera.fov / 2.0);
+        const inv_scale = depth / focal_pixels;
+
+        // Convert 2D flow to 3D velocity correction
+        // flow = (f/z) * v_3d -> v_3d = (z/f) * flow
+        const v_correction_right = residual.x * inv_scale;
+        const v_correction_up = -residual.y * inv_scale; // Flip Y back
+
+        // Proper Kalman gain using flow observation covariance
+        // In 2D projected space: K = σ²_prior / (σ²_prior + R)
+        // where σ²_prior is velocity variance projected to 2D
+        //
+        // Project prior velocity covariance to 2D flow space:
+        // For velocity in right/up directions, extract those variances
+        const scale_sq = (focal_pixels / depth) * (focal_pixels / depth);
+        const prior_var_right = prior_cov.get(0, 0) * right.x * right.x +
+            prior_cov.get(1, 1) * right.y * right.y +
+            prior_cov.get(2, 2) * right.z * right.z;
+        const prior_var_up = prior_cov.get(0, 0) * up.x * up.x +
+            prior_cov.get(1, 1) * up.y * up.y +
+            prior_cov.get(2, 2) * up.z * up.z;
+
+        // Project to 2D flow variance
+        const flow_var_prior_x = prior_var_right * scale_sq;
+        const flow_var_prior_y = prior_var_up * scale_sq;
+
+        // Observation covariance (from heteroscedastic Lucas-Kanade)
+        const R_xx = flow_obs.covariance.get(0, 0);
+        const R_yy = flow_obs.covariance.get(1, 1);
+
+        // Kalman gains for each axis: K = σ²_prior / (σ²_prior + R)
+        const eps = 1e-6;
+        const gain_x = flow_var_prior_x / (flow_var_prior_x + R_xx + eps);
+        const gain_y = flow_var_prior_y / (flow_var_prior_y + R_yy + eps);
+
+        // Apply Kalman update to velocity
+        var new_vel = prior_vel;
+        new_vel = new_vel.add(right.scale(v_correction_right * gain_x));
+        new_vel = new_vel.add(up.scale(v_correction_up * gain_y));
+
+        // Update velocity state
+        self.swarm.velocity_mean[entity_idx] = new_vel;
+
+        // Update velocity covariance: Σ_posterior = D * Σ_prior * D
+        // where D is a diagonal scaling matrix in the camera observation basis.
+        //
+        // This correctly preserves depth variance for ANY camera orientation by:
+        // 1. Rotating covariance to camera frame (right, up, view_dir basis)
+        // 2. Applying Kalman-style diagonal scaling (reduce right/up, preserve view_dir)
+        // 3. Rotating back to world frame
+        //
+        // The scaling factors are sqrt(1 - gain) so variance reduces by (1 - gain).
+        // View_dir (depth) has scale = 1 since flow doesn't observe it.
+
+        // Build rotation matrix: columns are camera basis vectors
+        const R = Mat3.fromColumns(right, up, view_dir);
+        const R_T = R.transpose();
+
+        // Transform covariance to camera frame: C_cam = R^T * C_world * R
+        const C_cam = R_T.mulMat(prior_cov).mulMat(R);
+
+        // Scaling factors for Kalman reduction: s_i such that var_new = var * s_i²
+        // For (1 - gain) reduction: s = sqrt(1 - gain)
+        const s_right = @sqrt(@max(0.01, 1.0 - gain_x));
+        const s_up = @sqrt(@max(0.01, 1.0 - gain_y));
+        const s_view: f32 = 1.0; // Depth preserved (unobserved)
+
+        // Apply scaling: C_cam_new[i,j] = s_i * C_cam[i,j] * s_j
+        // This is equivalent to D * C_cam * D where D = diag(s_right, s_up, s_view)
+        var C_cam_new: Mat3 = undefined;
+        const scales = [3]f32{ s_right, s_up, s_view };
+        for (0..3) |i| {
+            for (0..3) |j| {
+                C_cam_new.data[j * 3 + i] = scales[i] * C_cam.get(i, j) * scales[j];
+            }
+        }
+
+        // Transform back to world frame: C_world_new = R * C_cam_new * R^T
+        const new_cov = R.mulMat(C_cam_new).mulMat(R_T);
+
+        // Apply variance floor to diagonal elements for numerical stability
+        const min_var: f32 = 0.01;
+        var clamped_cov = new_cov;
+        clamped_cov.data[0] = @max(min_var, clamped_cov.data[0]); // xx
+        clamped_cov.data[4] = @max(min_var, clamped_cov.data[4]); // yy
+        clamped_cov.data[8] = @max(min_var, clamped_cov.data[8]); // zz
+
+        self.swarm.velocity_cov[entity_idx] = covToTriangle(clamped_cov);
 
         return marginal_ll;
     }
@@ -1219,8 +1618,9 @@ pub const SMCState = struct {
         const half_h: f32 = @floatFromInt(image_height / 2);
 
         // Convert pixel to NDC
+        // Image: Y increases downward, NDC: Y increases upward
         const ndc_x = (detection.pixel_x - half_w) / half_w;
-        const ndc_y = (detection.pixel_y - half_h) / half_h;
+        const ndc_y = (half_h - detection.pixel_y) / half_h; // Flip Y
 
         // Get ray direction from camera through detection
         const ray_dir = gmm.computeRayDirection(camera, ndc_x, ndc_y);
@@ -1236,7 +1636,8 @@ pub const SMCState = struct {
         //
         // Cov = depth_var * (d ⊗ d) + lateral_var * (I - d ⊗ d)
         //     = lateral_var * I + (depth_var - lateral_var) * (d ⊗ d)
-        const lateral_var = self.config.observation_noise * self.config.observation_noise;
+        const eff_noise = self.effectiveObservationNoise();
+        const lateral_var = eff_noise * eff_noise;
         const outer_dd = Mat3.outer(ray_dir, ray_dir);
         const obs_cov = Mat3.scaleMat(Mat3.identity, lateral_var)
             .add(outer_dd.scaleMat(depth_var - lateral_var));
@@ -1270,24 +1671,48 @@ pub const SMCState = struct {
             const proj = camera.project(entity_pos) orelse continue;
 
             // Find closest detection (data association)
+            // NDC: x [-1,1] left-to-right, y [-1,1] bottom-to-top
+            // Image: x [0,W] left-to-right, y [0,H] top-to-bottom
             const entity_px = (proj.ndc.x + 1) * half_w;
-            const entity_py = (proj.ndc.y + 1) * half_h;
+            const entity_py = (1 - proj.ndc.y) * half_h; // Flip Y for image coords
 
             var best_detection_idx: ?usize = null;
-            var best_dist_sq: f32 = std.math.inf(f32);
+            var best_cost: f32 = std.math.inf(f32);
+            var best_spatial_dist_sq: f32 = std.math.inf(f32);
+
+            // Get entity color for matching
+            const entity_color = self.swarm.color[i];
 
             for (detections, 0..) |det, det_idx| {
                 const dx = det.pixel_x - entity_px;
                 const dy = det.pixel_y - entity_py;
-                const dist_sq = dx * dx + dy * dy;
-                if (dist_sq < best_dist_sq) {
-                    best_dist_sq = dist_sq;
+                const spatial_dist_sq = dx * dx + dy * dy;
+
+                // Color distance (L2 in RGB space)
+                const color_diff = det.color.sub(entity_color);
+                const color_dist_sq = color_diff.x * color_diff.x +
+                    color_diff.y * color_diff.y +
+                    color_diff.z * color_diff.z;
+
+                // Combined cost: spatial + color (color weighted to be significant)
+                // Color distance range: 0-3 (max RGB diff), spatial: 0-hundreds of pixels
+                // Weight color so 0.5 color difference ~ 10 pixel spatial difference
+                const color_weight: f32 = 400.0; // (10 pixels)^2 / (0.5)^2
+                const cost = spatial_dist_sq + color_weight * color_dist_sq;
+
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best_spatial_dist_sq = spatial_dist_sq;
                     best_detection_idx = det_idx;
                 }
             }
 
+            // Use spatial distance for threshold (color helps selection, not gating)
+            const best_dist_sq = best_spatial_dist_sq;
+
             // If found a close enough detection, perform RBPF update
-            const max_match_dist: f32 = 15.0; // pixels
+            // Use generous threshold to avoid data association failure during fast motion
+            const max_match_dist: f32 = 50.0; // pixels (was 15.0)
             if (best_detection_idx) |det_idx| {
                 if (best_dist_sq < max_match_dist * max_match_dist) {
                     const det = detections[det_idx];
@@ -1300,9 +1725,16 @@ pub const SMCState = struct {
                         image_height,
                     );
 
-                    // Perform RBPF update (updates mean AND cov, returns marginal LL)
-                    const entity_ll = self.rbpfEntityObservationUpdate(i, obs.mean, obs.cov);
+                    // Perform 6D RBPF update (updates position AND velocity via cross-covariance)
+                    const entity_ll = self.rbpfEntityObservationUpdate6D(i, obs.mean, obs.cov);
                     total_log_lik += entity_ll;
+
+                    // Infer color from observation (exponential moving average)
+                    // Learning rate: 0.3 = moderate adaptation to observed color
+                    const color_lr: f32 = 0.3;
+                    const current_color = self.swarm.color[i];
+                    const observed_color = det.color;
+                    self.swarm.color[i] = current_color.scale(1.0 - color_lr).add(observed_color.scale(color_lr));
                 } else {
                     // No matching detection - entity might be occluded
                     // Apply small penalty for miss
@@ -1318,8 +1750,7 @@ pub const SMCState = struct {
     }
 
     /// RBPF step: unified observation update that returns marginal likelihood
-    /// This replaces the separate updateWeights + lateralPositionUpdate pattern
-    /// Fixes: double-dipping, LERP without covariance update, fixed gain
+    /// Includes optical flow velocity updates when enabled
     fn rbpfObservationStep(
         self: *SMCState,
         observation: ObservationGrid,
@@ -1328,105 +1759,165 @@ pub const SMCState = struct {
         const detections = Detection2D.extractFromGrid(observation, self.allocator) catch return;
         defer self.allocator.free(detections);
 
+        // Compute sparse optical flow if enabled and previous frame exists
+        var flow_observations: ?[]gmm.FlowObservation = null;
+        defer if (flow_observations) |flows| self.allocator.free(flows);
+
+        if (self.config.use_flow_observations) {
+            // Resolution-adaptive flow config (disabled below 48px)
+            const adapted = AdaptedFlowConfig.forResolution(observation.width, observation.height);
+
+            // Only compute flow if enabled for this resolution
+            if (adapted.enabled) {
+                if (self.prev_frame_data) |prev_data| {
+                    if (self.prev_detections) |prev_dets| {
+                        // Create temporary ObservationGrid views
+                        const prev_grid = ObservationGrid{
+                            .pixels = prev_data,
+                            .width = self.prev_frame_width,
+                            .height = self.prev_frame_height,
+                            .allocator = self.allocator,
+                        };
+
+                        // Compute sparse flow between consecutive frames
+                        flow_observations = gmm.computeSparseFlow(
+                            prev_dets,
+                            detections,
+                            prev_grid,
+                            observation,
+                            adapted.base,
+                            self.allocator,
+                        ) catch null;
+                    }
+                }
+            }
+        }
+
         // For each particle: update entities and accumulate marginal log-likelihood
         for (0..self.swarm.num_particles) |p| {
-            const marginal_ll = self.rbpfParticleObservationUpdate(
+            var marginal_ll = self.rbpfParticleObservationUpdate(
                 p,
                 detections,
                 observation.width,
                 observation.height,
             );
 
+            // Add velocity updates from flow observations
+            if (flow_observations) |flows| {
+                marginal_ll += self.rbpfParticleVelocityUpdate(
+                    p,
+                    flows,
+                    detections,
+                    observation.width,
+                    observation.height,
+                );
+            }
+
             // Weight by marginal likelihood (applies temperature for annealing)
             self.swarm.log_weights[p] += self.temperature * @as(f64, marginal_ll);
         }
 
         self.normalizeWeights();
+        self.updateSurpriseTracker();
+
+        // Store current frame for next iteration (if flow enabled)
+        if (self.config.use_flow_observations) {
+            self.storePreviousFrame(observation, detections);
+        }
     }
 
-    // =========================================================================
-    // Legacy lateral update (DEPRECATED - kept for reference)
-    // =========================================================================
+    /// Store observation frame for flow computation in next step
+    fn storePreviousFrame(self: *SMCState, observation: ObservationGrid, detections: []const Detection2D) void {
+        // Free old frame data
+        if (self.prev_frame_data) |old_data| {
+            self.allocator.free(old_data);
+        }
+        if (self.prev_detections) |old_dets| {
+            self.allocator.free(old_dets);
+        }
 
-    /// DEPRECATED: Use rbpfObservationStep instead
-    /// This function is kept for backwards compatibility but violates RBPF theory:
-    /// - Updates mean without updating covariance
-    /// - Uses fixed gain instead of Kalman gain
-    /// - Causes double-dipping when combined with updateWeights
-    fn lateralPositionUpdateLegacy(self: *SMCState, observation: ObservationGrid) void {
-        // Extract detections (shared across all particles)
-        const detections = Detection2D.extractFromGrid(observation, self.allocator) catch return;
-        defer self.allocator.free(detections);
+        // Copy current frame data
+        const n_pixels = @as(usize, observation.width) * observation.height;
+        self.prev_frame_data = self.allocator.alloc(Observation, n_pixels) catch {
+            self.prev_frame_data = null;
+            self.prev_detections = null;
+            return;
+        };
+        @memcpy(self.prev_frame_data.?, observation.pixels);
+        self.prev_frame_width = observation.width;
+        self.prev_frame_height = observation.height;
 
-        if (detections.len == 0) return;
+        // Copy detections
+        self.prev_detections = self.allocator.alloc(Detection2D, detections.len) catch {
+            self.allocator.free(self.prev_frame_data.?);
+            self.prev_frame_data = null;
+            self.prev_detections = null;
+            return;
+        };
+        @memcpy(self.prev_detections.?, detections);
+    }
 
-        // For each particle
-        for (0..self.swarm.num_particles) |p| {
-            const camera_pose = self.swarm.camera_poses[p];
-            const camera = camera_pose.toCamera(self.config.camera_intrinsics);
-            const slice = self.swarm.particleSlice(p);
+    /// Perform RBPF velocity update for all entities in a particle using flow observations
+    fn rbpfParticleVelocityUpdate(
+        self: *SMCState,
+        particle_idx: usize,
+        flow_observations: []const gmm.FlowObservation,
+        curr_detections: []const Detection2D,
+        image_width: u32,
+        image_height: u32,
+    ) f32 {
+        if (flow_observations.len == 0) return 0;
 
-            // For each entity in this particle
-            for (slice.start..slice.end) |i| {
-                if (!self.swarm.alive[i]) continue;
+        const camera_pose = self.swarm.camera_poses[particle_idx];
+        const camera = camera_pose.toCamera(self.config.camera_intrinsics);
+        const slice = self.swarm.particleSlice(particle_idx);
 
-                // Project entity to image space
-                const entity_pos = self.swarm.position_mean[i];
-                const proj = camera.project(entity_pos) orelse continue;
+        var total_log_lik: f32 = 0;
+        const half_w: f32 = @floatFromInt(image_width / 2);
+        const half_h: f32 = @floatFromInt(image_height / 2);
 
-                // Find closest detection
-                const half_w: f32 = @floatFromInt(observation.width / 2);
-                const half_h: f32 = @floatFromInt(observation.height / 2);
-                const entity_px = (proj.ndc.x + 1) * half_w;
-                const entity_py = (proj.ndc.y + 1) * half_h;
+        // For each entity, find associated flow observation and update velocity
+        for (slice.start..slice.end) |i| {
+            if (!self.swarm.alive[i]) continue;
 
-                var best_detection_idx: ?usize = null;
-                var best_dist_sq: f32 = std.math.inf(f32);
+            // Project entity to image space
+            // NDC: Y increases upward, Image: Y increases downward
+            const entity_pos = self.swarm.position_mean[i];
+            const proj = camera.project(entity_pos) orelse continue;
+            const entity_px = (proj.ndc.x + 1) * half_w;
+            const entity_py = (1 - proj.ndc.y) * half_h; // Flip Y
 
-                for (detections, 0..) |det, det_idx| {
-                    const dx = det.pixel_x - entity_px;
-                    const dy = det.pixel_y - entity_py;
-                    const dist_sq = dx * dx + dy * dy;
-                    if (dist_sq < best_dist_sq) {
-                        best_dist_sq = dist_sq;
-                        best_detection_idx = det_idx;
-                    }
-                }
+            // Find flow observation whose current detection is closest to this entity
+            var best_flow_idx: ?usize = null;
+            var best_dist_sq: f32 = 20.0 * 20.0; // Max match distance
 
-                // If found a close enough detection, update lateral position
-                const max_match_dist: f32 = 10.0; // pixels
-                if (best_detection_idx) |det_idx| {
-                    if (best_dist_sq < max_match_dist * max_match_dist) {
-                        const det = detections[det_idx];
-
-                        // Compute ray direction from camera through detection
-                        const det_ndc_x = (det.pixel_x - half_w) / half_w;
-                        const det_ndc_y = (det.pixel_y - half_h) / half_h;
-                        const det_ray_dir = gmm.computeRayDirection(camera, det_ndc_x, det_ndc_y);
-
-                        // Entity's actual distance from camera (Euclidean, not projection)
-                        const entity_dist = entity_pos.sub(camera.position).length();
-
-                        // Target: same distance from camera, but along detection ray
-                        const target_pos = camera.position.add(det_ray_dir.scale(entity_dist));
-
-                        // DEPRECATED: Fixed gain instead of proper Kalman gain
-                        const lateral_gain: f32 = 0.3;
-
-                        var updated_pos = entity_pos.scale(1 - lateral_gain).add(target_pos.scale(lateral_gain));
-
-                        // Renormalize to preserve distance from camera
-                        const updated_dist = updated_pos.sub(camera.position).length();
-                        if (updated_dist > 0.001) {
-                            const scale_factor = entity_dist / updated_dist;
-                            const offset = updated_pos.sub(camera.position);
-                            updated_pos = camera.position.add(offset.scale(scale_factor));
-                        }
-                        self.swarm.position_mean[i] = updated_pos;
-                    }
+            for (flow_observations, 0..) |flow, flow_idx| {
+                if (flow.curr_detection_idx >= curr_detections.len) continue;
+                const det = curr_detections[flow.curr_detection_idx];
+                const dx = det.pixel_x - entity_px;
+                const dy = det.pixel_y - entity_py;
+                const dist_sq = dx * dx + dy * dy;
+                if (dist_sq < best_dist_sq) {
+                    best_dist_sq = dist_sq;
+                    best_flow_idx = flow_idx;
                 }
             }
+
+            // If found matching flow, perform velocity update
+            if (best_flow_idx) |flow_idx| {
+                const flow = flow_observations[flow_idx];
+                const vel_ll = self.rbpfEntityVelocityUpdate(
+                    i,
+                    flow,
+                    camera,
+                    image_width,
+                    image_height,
+                );
+                total_log_lik += vel_ll;
+            }
         }
+
+        return total_log_lik;
     }
 
     // =========================================================================
@@ -1546,37 +2037,19 @@ pub const SMCState = struct {
         for (0..entity_slots) |i| {
             if (!self.swarm.alive[i]) continue;
 
-            // Get dynamics matrices for this entity's contact mode and physics type
-            const matrices = dynamics.DynamicsMatrices.forContactMode(
+            // 6D coupled Kalman prediction (builds cross-covariance over time)
+            const matrices_6d = dynamics.DynamicsMatrices6D.forContactModeWithParams(
                 self.swarm.contact_mode[i],
-                self.swarm.physics_type[i],
+                self.swarm.physics_params[i],
                 self.config.physics,
                 Vec3.unit_y, // Default contact normal
             );
 
-            // Build GaussianVec3 from swarm data
-            const vel = GaussianVec3{
-                .mean = self.swarm.velocity_mean[i],
-                .cov = triangleToCov(self.swarm.velocity_cov[i]),
-            };
-            const pos = GaussianVec3{
-                .mean = self.swarm.position_mean[i],
-                .cov = triangleToCov(self.swarm.position_cov[i]),
-            };
+            const prior = self.swarm.getState6D(i);
+            const predicted = dynamics.kalmanPredict6D(prior, matrices_6d);
 
-            // Kalman predict with covariance propagation
-            const new_vel = dynamics.kalmanPredictVelocity(vel, matrices);
-            const new_pos = dynamics.kalmanPredictPosition(pos, new_vel, matrices);
-
-            // Store results back (mean and covariance)
-            // Note: Process noise Q is already incorporated in covariance propagation
-            // by kalmanPredictVelocity/kalmanPredictPosition. In Rao-Blackwellized PF,
-            // mean evolves deterministically conditioned on discrete mode - uncertainty
-            // is captured entirely in the covariance.
-            self.swarm.velocity_mean[i] = new_vel.mean;
-            self.swarm.velocity_cov[i] = covToTriangle(new_vel.cov);
-            self.swarm.position_mean[i] = new_pos.mean;
-            self.swarm.position_cov[i] = covToTriangle(new_pos.cov);
+            // Store results (setState6D also syncs factored arrays for compatibility)
+            self.swarm.setState6D(i, predicted);
 
             // Apply goal-directed control (Phase 1b)
             // Goal control acts as an acceleration term on velocity
@@ -1590,26 +2063,51 @@ pub const SMCState = struct {
                 );
             }
 
-            // Ground collision detection and response
-            if (self.swarm.position_mean[i].y < self.config.physics.ground_height) {
-                self.swarm.position_mean[i].y = self.config.physics.ground_height;
+            // Environment collision detection and response (unified ground/wall handling)
+            const ground_height = self.config.physics.groundHeight();
+            if (self.swarm.position_mean[i].y < ground_height) {
+                self.swarm.position_mean[i].y = ground_height;
 
                 if (self.swarm.velocity_mean[i].y < 0) {
-                    // Ball hit ground while moving down - apply bounce
-                    const elasticity = self.swarm.physics_type[i].elasticity();
-                    self.swarm.velocity_mean[i].y = -self.swarm.velocity_mean[i].y * elasticity;
+                    // Ball hit environment while moving down - apply bounce
+                    // Use continuous physics_params (Spelke-aligned inference)
+                    const elasticity = self.swarm.physics_params[i].elasticity;
+                    const vel_before = self.swarm.velocity_mean[i].y;
+                    self.swarm.velocity_mean[i].y = -vel_before * elasticity;
+
+                    // ELASTICITY INFERENCE: Observe bounce to update physics params
+                    // Compare predicted bounce with actual (pre-bounce) velocity
+                    // observed_elasticity = |v_after| / |v_before|
+                    // We use prev_velocity which was set before dynamics step
+                    const prev_vel_y = self.swarm.prev_velocity_mean[i].y;
+                    if (prev_vel_y < -0.5) { // Only update if significant downward velocity
+                        // The ball was falling with prev_vel_y, now bouncing
+                        // We can infer what elasticity should be based on actual motion
+                        // For now, use current velocity as "observed" for the update
+                        // Higher confidence when velocity is larger (more informative bounce)
+                        const confidence = @min(1.0, @abs(prev_vel_y) / 5.0);
+                        // The applied elasticity is what we observe
+                        self.swarm.physics_params_uncertainty[i].updateElasticity(elasticity, confidence * 0.5);
+                        // Update point estimate from posterior mean
+                        self.swarm.physics_params[i].elasticity = self.swarm.physics_params_uncertainty[i].elasticityMean();
+                    }
+
                     // After bounce, ball is moving up - set to free so dynamics doesn't zero velocity
                     self.swarm.contact_mode[i] = .free;
                 } else {
-                    // Ball at ground but not moving down (resting or very slow)
-                    self.swarm.contact_mode[i] = .ground;
+                    // Ball at environment but not moving down (resting or very slow)
+                    self.swarm.contact_mode[i] = .environment;
                 }
-            } else if (self.swarm.position_mean[i].y > self.config.physics.ground_height + 0.1) {
-                // Clear ground contact if sufficiently above
-                if (self.swarm.contact_mode[i] == .ground) {
+            } else if (self.swarm.position_mean[i].y > ground_height + 0.1) {
+                // Clear environment contact if sufficiently above
+                if (self.swarm.contact_mode[i] == .environment) {
                     self.swarm.contact_mode[i] = .free;
                 }
             }
+
+            // Sync 6D state mean after any position/velocity modifications
+            // (bounce handling modified factored arrays directly)
+            self.swarm.syncFactoredTo6DMean(i);
         }
 
         // Entity-entity collisions
@@ -1647,6 +2145,10 @@ pub const SMCState = struct {
 
                         self.swarm.velocity_mean[i] = self.swarm.velocity_mean[i].sub(v1n).add(v2n);
                         self.swarm.velocity_mean[j] = self.swarm.velocity_mean[j].sub(v2n).add(v1n);
+
+                        // Sync 6D state mean after collision modifications
+                        self.swarm.syncFactoredTo6DMean(i);
+                        self.swarm.syncFactoredTo6DMean(j);
                     }
                 }
             }
@@ -1656,12 +2158,9 @@ pub const SMCState = struct {
     /// Single SMC step: propagate, weight, resample, rejuvenate
     /// Camera is no longer a parameter - each particle has its own camera hypothesis
     ///
-    /// Two modes based on `use_rbpf_observation` config:
-    /// - RBPF mode (default): Uses proper Rao-Blackwellized observation update
-    ///   that updates both mean and covariance via Kalman filter, returning
-    ///   marginal likelihood for weighting. Theoretically sound.
-    /// - Legacy mode: Separate updateWeights + lateralPositionUpdate.
-    ///   Violates RBPF theory (double-dipping) but kept for comparison.
+    /// Uses Rao-Blackwellized observation update that updates both mean and
+    /// covariance via Kalman filter, returning marginal likelihood for weighting.
+    /// References: Doucet et al. (2000), SMCP3 (Lew et al. 2023)
     pub fn step(
         self: *SMCState,
         observation: ObservationGrid,
@@ -1669,54 +2168,19 @@ pub const SMCState = struct {
         // 1. Propagate particles through dynamics (camera + entities)
         self.stepSwarmPhysics();
 
-        if (self.config.use_rbpf_observation and self.config.use_back_projection) {
-            // =====================================================
-            // RBPF MODE: Proper Rao-Blackwellized observation update
-            // =====================================================
-            // Uses observation ONCE via Kalman update, returns marginal
-            // likelihood for weighting. No double-dipping.
-            // References: Doucet et al. (2000), SMCP3 (Lew et al. 2023)
+        // 2. RBPF observation step: updates entities AND computes weights
+        // Uses observation ONCE via Kalman update, returns marginal likelihood
+        self.rbpfObservationStep(observation);
 
-            // 2. RBPF observation step: updates entities AND computes weights
-            self.rbpfObservationStep(observation);
+        // 3. Check ESS and resample if needed
+        const ess = self.effectiveSampleSize();
+        const threshold = self.config.ess_threshold * @as(f32, @floatFromInt(self.config.num_particles));
 
-            // 3. Check ESS and resample if needed
-            const ess = self.effectiveSampleSize();
-            const threshold = self.config.ess_threshold * @as(f32, @floatFromInt(self.config.num_particles));
+        if (ess < threshold) {
+            try self.resample();
 
-            if (ess < threshold) {
-                try self.resample();
-
-                // 4. Gibbs rejuvenation after resampling (for discrete variables)
-                self.gibbsRejuvenation(observation);
-            }
-        } else {
-            // =====================================================
-            // LEGACY MODE: Separate weighting and position update
-            // =====================================================
-            // WARNING: Violates RBPF theory:
-            // - Double-dipping: observation used for both weighting AND update
-            // - LERP without covariance update
-            // - Fixed gain instead of Kalman gain
-
-            // 2. Update weights with observation likelihood
-            self.updateWeights(observation);
-
-            // 3. Check ESS and resample if needed
-            const ess = self.effectiveSampleSize();
-            const threshold = self.config.ess_threshold * @as(f32, @floatFromInt(self.config.num_particles));
-
-            if (ess < threshold) {
-                try self.resample();
-
-                // 4a. Legacy lateral position update (DEPRECATED)
-                if (self.config.use_back_projection) {
-                    self.lateralPositionUpdateLegacy(observation);
-                }
-
-                // 4b. Gibbs rejuvenation after resampling
-                self.gibbsRejuvenation(observation);
-            }
+            // 4. Gibbs rejuvenation after resampling (for discrete variables)
+            self.gibbsRejuvenation(observation);
         }
 
         // 5. CRP trans-dimensional moves (if enabled)
@@ -1756,68 +2220,43 @@ pub const SMCState = struct {
         }
     }
 
-    /// Get posterior estimate of physics types (mode for each entity)
-    pub fn getPhysicsTypeEstimate(self: SMCState) ![]PhysicsType {
+    /// Get posterior estimate of physics params (weighted mean for each entity)
+    pub fn getPhysicsParamsEstimate(self: SMCState) ![]PhysicsParams {
         // Use entity count from first particle (assumes all have same count)
         const n_entities = self.swarm.entity_counts[0];
         if (n_entities == 0) {
-            return &[_]PhysicsType{};
+            return &[_]PhysicsParams{};
         }
 
-        var estimates = try self.allocator.alloc(PhysicsType, n_entities);
+        var estimates = try self.allocator.alloc(PhysicsParams, n_entities);
 
         for (0..n_entities) |entity_idx| {
-            // Count weighted votes for each physics type
-            var votes: [4]f32 = .{ 0, 0, 0, 0 };
+            var weighted_elasticity: f32 = 0;
+            var weighted_friction: f32 = 0;
+            var total_weight: f32 = 0;
 
             for (0..self.swarm.num_particles) |p| {
                 const weight = self.weights[p];
                 const i = self.swarm.idx(p, entity_idx);
                 if (self.swarm.alive[i]) {
-                    const ptype = self.swarm.physics_type[i];
-                    votes[@intFromEnum(ptype)] += weight;
+                    const params = self.swarm.physics_params[i];
+                    weighted_elasticity += weight * params.elasticity;
+                    weighted_friction += weight * params.friction;
+                    total_weight += weight;
                 }
             }
 
-            // Find mode
-            var max_votes: f32 = 0;
-            var max_idx: usize = 0;
-            for (votes, 0..) |v, i| {
-                if (v > max_votes) {
-                    max_votes = v;
-                    max_idx = i;
-                }
+            if (total_weight > 0) {
+                estimates[entity_idx] = .{
+                    .elasticity = weighted_elasticity / total_weight,
+                    .friction = weighted_friction / total_weight,
+                };
+            } else {
+                estimates[entity_idx] = PhysicsParams.prior;
             }
-
-            estimates[entity_idx] = @enumFromInt(max_idx);
         }
 
         return estimates;
-    }
-
-    /// Get posterior probability distribution over physics types for each entity
-    pub fn getPhysicsTypePosterior(self: SMCState) ![][4]f32 {
-        const n_entities = self.swarm.entity_counts[0];
-        if (n_entities == 0) {
-            return &[_][4]f32{};
-        }
-
-        var posteriors = try self.allocator.alloc([4]f32, n_entities);
-
-        for (0..n_entities) |entity_idx| {
-            posteriors[entity_idx] = .{ 0, 0, 0, 0 };
-
-            for (0..self.swarm.num_particles) |p| {
-                const weight = self.weights[p];
-                const i = self.swarm.idx(p, entity_idx);
-                if (self.swarm.alive[i]) {
-                    const ptype = self.swarm.physics_type[i];
-                    posteriors[entity_idx][@intFromEnum(ptype)] += weight;
-                }
-            }
-        }
-
-        return posteriors;
     }
 
     /// Camera belief (weighted statistics over particle camera poses)
@@ -1905,8 +2344,8 @@ pub const SMCState = struct {
 
     /// Physics belief for a single entity: expectations and variances
     pub const PhysicsBelief = struct {
-        /// Categorical posterior: p(type) for each physics type
-        /// Index by @intFromEnum(PhysicsType)
+        /// Categorical posterior: p(type) for 4 discrete material bins
+        /// (legacy compatibility - prefer expected_elasticity/friction for continuous inference)
         type_probabilities: [4]f32,
 
         /// Expected elasticity (bounce coefficient)
@@ -1923,6 +2362,15 @@ pub const SMCState = struct {
         /// Low ESS indicates particle degeneracy
         effective_sample_size: f32,
     };
+
+    /// Discretize continuous physics params to type bucket (for backward compat)
+    fn discretizeParams(params: PhysicsParams) usize {
+        // Classify by elasticity thresholds (same logic as C API)
+        if (params.elasticity > 0.8) return 1; // bouncy
+        if (params.elasticity < 0.3 and params.friction > 0.6) return 2; // sticky
+        if (params.friction < 0.15) return 3; // slippery
+        return 0; // standard
+    }
 
     /// Compute physics belief for each entity using weighted expectations
     pub fn getPhysicsBelief(self: SMCState) ![]PhysicsBelief {
@@ -1946,14 +2394,12 @@ pub const SMCState = struct {
                 const i = self.swarm.idx(p, entity_idx);
 
                 if (self.swarm.alive[i]) {
-                    const ptype = self.swarm.physics_type[i];
-                    type_probs[@intFromEnum(ptype)] += weight;
+                    const params = self.swarm.physics_params[i];
+                    const type_idx = discretizeParams(params);
+                    type_probs[type_idx] += weight;
 
-                    const elasticity = ptype.elasticity();
-                    const friction = ptype.friction();
-
-                    expected_elasticity += weight * elasticity;
-                    expected_friction += weight * friction;
+                    expected_elasticity += weight * params.elasticity;
+                    expected_friction += weight * params.friction;
                     sum_weight_sq += weight * weight;
                 }
             }
@@ -1967,12 +2413,10 @@ pub const SMCState = struct {
                 const i = self.swarm.idx(p, entity_idx);
 
                 if (self.swarm.alive[i]) {
-                    const ptype = self.swarm.physics_type[i];
-                    const elasticity = ptype.elasticity();
-                    const friction = ptype.friction();
+                    const params = self.swarm.physics_params[i];
 
-                    const e_diff = elasticity - expected_elasticity;
-                    const f_diff = friction - expected_friction;
+                    const e_diff = params.elasticity - expected_elasticity;
+                    const f_diff = params.friction - expected_friction;
 
                     elasticity_var += weight * e_diff * e_diff;
                     friction_var += weight * f_diff * f_diff;
@@ -2729,22 +3173,20 @@ test "scenario: two-ball chase - goal control produces tracking behavior" {
     // Ball A (target) - label (0, 0)
     const label_a = Label{ .birth_time = 0, .birth_index = 0 };
     smc_state.swarm.label[0] = label_a;
-    smc_state.swarm.position_mean[0] = Vec3.init(10.0, 0.0, 0.0); // Target at x=10
-    smc_state.swarm.velocity_mean[0] = Vec3.zero;
+    smc_state.swarm.initState6D(0, Vec3.init(10.0, 0.0, 0.0), Vec3.zero); // Target at x=10
     smc_state.swarm.goal_type[0] = .none; // A is passive
     smc_state.swarm.alive[0] = true;
-    smc_state.swarm.physics_type[0] = .standard;
+    smc_state.swarm.physics_params[0] = PhysicsParams.standard;
     smc_state.swarm.contact_mode[0] = .free;
 
     // Ball B (chaser) - label (0, 1), tracking A
     const label_b = Label{ .birth_time = 0, .birth_index = 1 };
     smc_state.swarm.label[1] = label_b;
-    smc_state.swarm.position_mean[1] = Vec3.zero; // Chaser at origin
-    smc_state.swarm.velocity_mean[1] = Vec3.zero;
+    smc_state.swarm.initState6D(1, Vec3.zero, Vec3.zero); // Chaser at origin
     smc_state.swarm.goal_type[1] = .track;
     smc_state.swarm.target_label[1] = label_a; // Tracking Ball A
     smc_state.swarm.alive[1] = true;
-    smc_state.swarm.physics_type[1] = .standard;
+    smc_state.swarm.physics_params[1] = PhysicsParams.standard;
     smc_state.swarm.contact_mode[1] = .free;
 
     smc_state.swarm.entity_counts[0] = 2;
@@ -2779,22 +3221,20 @@ test "scenario: two-ball chase - avoid produces fleeing behavior" {
     // Ball A (threat)
     const label_a = Label{ .birth_time = 0, .birth_index = 0 };
     smc_state.swarm.label[0] = label_a;
-    smc_state.swarm.position_mean[0] = Vec3.init(3.0, 0.0, 0.0); // Close threat
-    smc_state.swarm.velocity_mean[0] = Vec3.zero;
+    smc_state.swarm.initState6D(0, Vec3.init(3.0, 0.0, 0.0), Vec3.zero); // Close threat
     smc_state.swarm.goal_type[0] = .none;
     smc_state.swarm.alive[0] = true;
-    smc_state.swarm.physics_type[0] = .standard;
+    smc_state.swarm.physics_params[0] = PhysicsParams.standard;
     smc_state.swarm.contact_mode[0] = .free;
 
     // Ball B (fleeing)
     const label_b = Label{ .birth_time = 0, .birth_index = 1 };
     smc_state.swarm.label[1] = label_b;
-    smc_state.swarm.position_mean[1] = Vec3.zero;
-    smc_state.swarm.velocity_mean[1] = Vec3.zero;
+    smc_state.swarm.initState6D(1, Vec3.zero, Vec3.zero);
     smc_state.swarm.goal_type[1] = .avoid;
     smc_state.swarm.target_label[1] = label_a;
     smc_state.swarm.alive[1] = true;
-    smc_state.swarm.physics_type[1] = .standard;
+    smc_state.swarm.physics_params[1] = PhysicsParams.standard;
     smc_state.swarm.contact_mode[1] = .free;
 
     smc_state.swarm.entity_counts[0] = 2;
@@ -2931,7 +3371,7 @@ test "integration: RGB inference on synthetic bouncing ball" {
     config.max_entities = 4;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.5;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -2953,7 +3393,7 @@ test "integration: RGB inference on synthetic bouncing ball" {
     defer smc.deinit();
 
     // Ground truth: bouncy ball at (0, 5, 0), dropped with zero velocity
-    const gt_physics: PhysicsType = .bouncy;
+    const gt_physics = PhysicsParams{ .elasticity = 0.9, .friction = 0.2 }; // Bouncy
     const gt_initial_pos = Vec3.init(0, 5, 0);
     const gt_initial_vel = Vec3.zero;
 
@@ -2988,9 +3428,9 @@ test "integration: RGB inference on synthetic bouncing ball" {
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
         // Ground collision with bounce
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity(); // Bouncy!
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity; // Bouncy!
         }
 
         // Render observation from ground truth
@@ -3002,8 +3442,8 @@ test "integration: RGB inference on synthetic bouncing ball" {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = gt_physics,
-            .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+            .physics_params = gt_physics,
+            .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -3109,7 +3549,7 @@ test "inference: sticky ball stops on ground" {
     config.max_entities = 2;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -3128,7 +3568,7 @@ test "inference: sticky ball stops on ground" {
     defer smc.deinit();
 
     // Ground truth: STICKY ball
-    const gt_physics: PhysicsType = .sticky;
+    const gt_physics = PhysicsParams{ .elasticity = 0.1, .friction = 0.8 }; // Sticky
     const gt_initial_pos = Vec3.init(0, 3, 0);
     const gt_initial_vel = Vec3.zero;
 
@@ -3159,11 +3599,11 @@ test "inference: sticky ball stops on ground" {
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
         // Sticky collision: zero elasticity, high friction
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity(); // elasticity=0 → stops
-            gt_vel.x *= (1.0 - gt_physics.friction()); // high friction
-            gt_vel.z *= (1.0 - gt_physics.friction());
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity; // elasticity=0 → stops
+            gt_vel.x *= (1.0 - gt_physics.friction); // high friction
+            gt_vel.z *= (1.0 - gt_physics.friction);
         }
 
         var observation = try ObservationGrid.init(obs_width, obs_height, allocator);
@@ -3173,8 +3613,8 @@ test "inference: sticky ball stops on ground" {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = gt_physics,
-            .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+            .physics_params = gt_physics,
+            .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -3252,7 +3692,7 @@ test "inference: slippery ball slides on ramp" {
     config.max_entities = 2;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -3271,7 +3711,7 @@ test "inference: slippery ball slides on ramp" {
     defer smc.deinit();
 
     // Ground truth: SLIPPERY ball with horizontal velocity
-    const gt_physics: PhysicsType = .slippery;
+    const gt_physics = PhysicsParams{ .elasticity = 0.6, .friction = 0.05 }; // Slippery
     const gt_initial_pos = Vec3.init(-2, 1, 0); // Start low and to the left
     const gt_initial_vel = Vec3.init(3, 0, 0); // Moving right
 
@@ -3301,12 +3741,12 @@ test "inference: slippery ball slides on ramp" {
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
         // Ground contact with slippery physics
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity();
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity;
             // Slippery: very low friction → ball keeps sliding
-            gt_vel.x *= (1.0 - gt_physics.friction());
-            gt_vel.z *= (1.0 - gt_physics.friction());
+            gt_vel.x *= (1.0 - gt_physics.friction);
+            gt_vel.z *= (1.0 - gt_physics.friction);
         }
 
         var observation = try ObservationGrid.init(obs_width, obs_height, allocator);
@@ -3316,8 +3756,8 @@ test "inference: slippery ball slides on ramp" {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = gt_physics,
-            .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+            .physics_params = gt_physics,
+            .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -3390,7 +3830,7 @@ test "inference: two-object crossing maintains identity" {
     config.max_entities = 4;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -3461,8 +3901,8 @@ test "inference: two-object crossing maintains identity" {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = pos_0, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = vel_0, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = .standard,
-            .contact_mode = .ground,
+            .physics_params = PhysicsParams.standard,
+            .contact_mode = .environment,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -3476,8 +3916,8 @@ test "inference: two-object crossing maintains identity" {
             .label = Label{ .birth_time = 0, .birth_index = 1 },
             .position = GaussianVec3{ .mean = pos_1, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = vel_1, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = .standard,
-            .contact_mode = .ground,
+            .physics_params = PhysicsParams.standard,
+            .contact_mode = .environment,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{
@@ -3539,7 +3979,7 @@ test "inference: object temporarily occluded" {
     config.max_entities = 4;
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -3557,7 +3997,7 @@ test "inference: object temporarily occluded" {
     var smc = try SMCState.init(allocator, config, prng.random());
     defer smc.deinit();
 
-    const gt_physics: PhysicsType = .bouncy;
+    const gt_physics = PhysicsParams{ .elasticity = 0.9, .friction = 0.2 }; // Bouncy
     const gt_initial_pos = Vec3.init(0, 5, 0);
     const gt_initial_vel = Vec3.zero;
 
@@ -3590,9 +4030,9 @@ test "inference: object temporarily occluded" {
         gt_vel = gt_vel.add(config.physics.gravity.scale(config.physics.dt));
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity();
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity;
         }
 
         var observation = try ObservationGrid.init(obs_width, obs_height, allocator);
@@ -3606,8 +4046,8 @@ test "inference: object temporarily occluded" {
                 .label = Label{ .birth_time = 0, .birth_index = 0 },
                 .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
                 .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-                .physics_type = gt_physics,
-                .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+                .physics_params = gt_physics,
+                .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
                 .track_state = .detected,
                 .occlusion_count = 0,
                 .appearance = .{
@@ -3667,7 +4107,7 @@ test "inference: clutter robustness (spurious detections)" {
     config.max_entities = 6; // Allow some headroom for spurious tracks
     config.physics.gravity = Vec3.init(0, -10, 0);
     config.physics.dt = 0.1;
-    config.physics.ground_height = 0.0;
+    // Ground is at y=0 by default via environment config
     config.observation_noise = 0.3;
     config.ess_threshold = 0.3;
     config.use_tempering = true;
@@ -3685,7 +4125,7 @@ test "inference: clutter robustness (spurious detections)" {
     var smc = try SMCState.init(allocator, config, prng.random());
     defer smc.deinit();
 
-    const gt_physics: PhysicsType = .standard;
+    const gt_physics = PhysicsParams{ .elasticity = 0.5, .friction = 0.5 }; // Standard
     const gt_initial_pos = Vec3.init(0, 4, 0);
     const gt_initial_vel = Vec3.zero;
 
@@ -3716,9 +4156,9 @@ test "inference: clutter robustness (spurious detections)" {
         gt_vel = gt_vel.add(config.physics.gravity.scale(config.physics.dt));
         gt_pos = gt_pos.add(gt_vel.scale(config.physics.dt));
 
-        if (gt_pos.y < config.physics.ground_height) {
-            gt_pos.y = config.physics.ground_height;
-            gt_vel.y = -gt_vel.y * gt_physics.elasticity();
+        if (gt_pos.y < config.physics.groundHeight()) {
+            gt_pos.y = config.physics.groundHeight();
+            gt_vel.y = -gt_vel.y * gt_physics.elasticity;
         }
 
         var observation = try ObservationGrid.init(obs_width, obs_height, allocator);
@@ -3729,8 +4169,8 @@ test "inference: clutter robustness (spurious detections)" {
             .label = Label{ .birth_time = 0, .birth_index = 0 },
             .position = GaussianVec3{ .mean = gt_pos, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
             .velocity = GaussianVec3{ .mean = gt_vel, .cov = Mat3.diagonal(Vec3.splat(0.01)) },
-            .physics_type = gt_physics,
-            .contact_mode = if (gt_pos.y <= config.physics.ground_height + 0.1) .ground else .free,
+            .physics_params = gt_physics,
+            .contact_mode = if (gt_pos.y <= config.physics.groundHeight() + 0.1) .environment else .free,
             .track_state = .detected,
             .occlusion_count = 0,
             .appearance = .{

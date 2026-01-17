@@ -17,7 +17,7 @@ const fizz = @import("fizz");
 const Vec3 = fizz.Vec3;
 const Entity = fizz.Entity;
 const Label = fizz.Label;
-const PhysicsType = fizz.PhysicsType;
+const PhysicsParams = fizz.PhysicsParams;
 const PhysicsConfig = fizz.PhysicsConfig;
 const Camera = fizz.Camera;
 const World = fizz.World;
@@ -51,14 +51,33 @@ pub const FizzVec3 = extern struct {
     z: f32,
 };
 
-/// Physics type enumeration.
+/// Physics type enumeration (convenience presets, maps to continuous PhysicsParams).
 /// Uses c_int to match C enum ABI (typically 4 bytes).
 pub const FizzPhysicsType = enum(c_int) {
     standard = 0,
     bouncy = 1,
     sticky = 2,
     slippery = 3,
+
+    /// Convert to continuous PhysicsParams
+    pub fn toParams(self: FizzPhysicsType) PhysicsParams {
+        return switch (self) {
+            .standard => PhysicsParams.standard,
+            .bouncy => PhysicsParams{ .elasticity = 0.9, .friction = 0.2 },
+            .sticky => PhysicsParams{ .elasticity = 0.2, .friction = 0.8 },
+            .slippery => PhysicsParams{ .elasticity = 0.7, .friction = 0.1 },
+        };
+    }
 };
+
+/// Convert continuous PhysicsParams to nearest discrete type (for C API compatibility)
+fn physicsParamsToType(params: PhysicsParams) FizzPhysicsType {
+    // Classify by elasticity thresholds
+    if (params.elasticity > 0.8) return .bouncy;
+    if (params.elasticity < 0.3 and params.friction > 0.6) return .sticky;
+    if (params.friction < 0.15) return .slippery;
+    return .standard;
+}
 
 /// Physics configuration.
 pub const FizzPhysicsConfig = extern struct {
@@ -169,10 +188,20 @@ fn getAllocator() std.mem.Allocator {
 export fn fizz_world_create(config: *const FizzPhysicsConfig) ?*FizzWorld {
     const allocator = getAllocator();
 
+    // Configure environment from C ground_height
+    const env_config = fizz.EnvironmentConfig{
+        .ground = .{
+            .height = config.ground_height,
+            .normal = Vec3.unit_y,
+            .friction = 0.5,
+            .elasticity = 0.5,
+        },
+    };
+
     const zig_config = PhysicsConfig{
         .gravity = Vec3.init(config.gravity_x, config.gravity_y, config.gravity_z),
         .dt = config.dt,
-        .ground_height = config.ground_height,
+        .environment = env_config,
         .bounds_min = Vec3.init(config.bounds_min_x, config.bounds_min_y, config.bounds_min_z),
         .bounds_max = Vec3.init(config.bounds_max_x, config.bounds_max_y, config.bounds_max_z),
         .process_noise = config.process_noise,
@@ -210,11 +239,10 @@ export fn fizz_entity_add(
 ) FizzEntityId {
     const state = worldState(world_ptr) orelse return 0;
 
-    const zig_ptype: PhysicsType = @enumFromInt(@intFromEnum(physics_type));
     const entity = state.world.addEntity(
         Vec3.init(x, y, z),
         Vec3.init(vx, vy, vz),
-        zig_ptype,
+        physics_type.toParams(),
     ) catch return 0;
 
     return encodeEntityId(entity.label);
@@ -338,7 +366,7 @@ export fn fizz_world_get_entity(world_ptr: ?*FizzWorld, index: u32, out: *FizzEn
                     .vel_x = vel.x,
                     .vel_y = vel.y,
                     .vel_z = vel.z,
-                    .physics_type = @enumFromInt(@intFromEnum(entity.physics_type)),
+                    .physics_type = physicsParamsToType(entity.physics_params),
                     .is_alive = true,
                 };
                 return .ok;
@@ -360,10 +388,20 @@ export fn fizz_smc_create(
 ) ?*FizzSMC {
     const allocator = getAllocator();
 
+    // Configure environment from C ground_height
+    const env_config = fizz.EnvironmentConfig{
+        .ground = .{
+            .height = physics_config.ground_height,
+            .normal = Vec3.unit_y,
+            .friction = 0.5,
+            .elasticity = 0.5,
+        },
+    };
+
     const zig_physics = PhysicsConfig{
         .gravity = Vec3.init(physics_config.gravity_x, physics_config.gravity_y, physics_config.gravity_z),
         .dt = physics_config.dt,
-        .ground_height = physics_config.ground_height,
+        .environment = env_config,
         .bounds_min = Vec3.init(physics_config.bounds_min_x, physics_config.bounds_min_y, physics_config.bounds_min_z),
         .bounds_max = Vec3.init(physics_config.bounds_max_x, physics_config.bounds_max_y, physics_config.bounds_max_z),
         .process_noise = physics_config.process_noise,
@@ -522,16 +560,16 @@ export fn fizz_smc_get_posteriors(
 ) u32 {
     const state = smcState(smc_ptr) orelse return 0;
 
-    const posteriors = state.smc.getPhysicsTypePosterior() catch return 0;
-    defer state.allocator.free(posteriors);
+    const beliefs = state.smc.getPhysicsBelief() catch return 0;
+    defer state.allocator.free(beliefs);
 
-    const count = @min(@as(u32, @intCast(posteriors.len)), max_count);
+    const count = @min(@as(u32, @intCast(beliefs.len)), max_count);
     for (0..count) |i| {
         out[i] = .{
-            .prob_standard = posteriors[i][0],
-            .prob_bouncy = posteriors[i][1],
-            .prob_sticky = posteriors[i][2],
-            .prob_slippery = posteriors[i][3],
+            .prob_standard = beliefs[i].type_probabilities[0],
+            .prob_bouncy = beliefs[i].type_probabilities[1],
+            .prob_sticky = beliefs[i].type_probabilities[2],
+            .prob_slippery = beliefs[i].type_probabilities[3],
         };
     }
     return count;

@@ -24,7 +24,8 @@ const Mat3 = math.Mat3;
 // Use types.zig for shared type definitions
 const types = @import("../types.zig");
 const Label = types.Label;
-const PhysicsType = types.PhysicsType;
+const PhysicsParams = types.PhysicsParams;
+const PhysicsParamsUncertainty = types.PhysicsParamsUncertainty;
 const ContactMode = types.ContactMode;
 const TrackState = types.TrackState;
 const GoalType = types.GoalType;
@@ -81,7 +82,7 @@ pub const ParticleWorldView = struct {
         self: Self,
         pos: Vec3,
         vel: Vec3,
-        ptype: PhysicsType,
+        params: PhysicsParams,
     ) ?EntityId {
         // Find free slot
         for (0..self.swarm.max_entities) |e| {
@@ -92,7 +93,8 @@ pub const ParticleWorldView = struct {
                 self.swarm.position_cov[i] = covToTriangle(Mat3.diagonal(Vec3.splat(0.1)));
                 self.swarm.velocity_mean[i] = vel;
                 self.swarm.velocity_cov[i] = covToTriangle(Mat3.diagonal(Vec3.splat(0.1)));
-                self.swarm.physics_type[i] = ptype;
+                self.swarm.physics_params[i] = params;
+                self.swarm.physics_params_uncertainty[i] = PhysicsParamsUncertainty.vague;
                 self.swarm.contact_mode[i] = .free;
                 self.swarm.track_state[i] = .detected;
                 self.swarm.label[i] = Label{ .birth_time = 0, .birth_index = 0 };
@@ -173,18 +175,18 @@ pub const ParticleWorldView = struct {
     }
 
     // =========================================================================
-    // Physics Type Component
+    // Physics Params Component
     // =========================================================================
 
-    pub fn getPhysicsType(self: Self, entity: EntityId) ?PhysicsType {
+    pub fn getPhysicsParams(self: Self, entity: EntityId) ?PhysicsParams {
         const i = self.idx(entity.index);
         if (!self.swarm.alive[i]) return null;
-        return self.swarm.physics_type[i];
+        return self.swarm.physics_params[i];
     }
 
-    pub fn setPhysicsType(self: Self, entity: EntityId, ptype: PhysicsType) void {
+    pub fn setPhysicsParams(self: Self, entity: EntityId, params: PhysicsParams) void {
         const i = self.idx(entity.index);
-        self.swarm.physics_type[i] = ptype;
+        self.swarm.physics_params[i] = params;
     }
 
     // =========================================================================
